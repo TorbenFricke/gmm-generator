@@ -7,10 +7,10 @@ implemented.)
 
 ## Model
 
-- **Active load**: $P \sim \mathcal{N}(\mu, \sigma)$ truncated to $[0, P_{\text{max}}]$, with
-  $\mu = \mu_{\text{ratio}} P_{\text{max}}$ and $\sigma = \sigma_{\text{ratio}} P_{\text{max}}$.
+- **Active load**: $P_{\text{active}} \sim \mathcal{N}(\mu, \sigma^2)$ truncated to $[0, P_{\max}]$, with
+  $\mu = \mu_{\text{ratio}} P_{\max}$ and $\sigma = \sigma_{\text{ratio}} P_{\max}$.
   $\mu$ is the *location* of the underlying normal distribution; because of the truncation the
-  expected active power $E[P]$ (reported as `E[active]`) differs from $\mu$.
+  expected active power $E[P_{\text{active}}]$ (reported as `E[active]`) differs from $\mu$.
 - **Time profiles**: $p(\text{on}) = f_{\text{month}}(m) \cdot f_{\text{interval}}(t, \text{day type})$,
   clipped to $[0, 1]$, from 12 month factors and 96 15-minute interval factors for weekdays and weekends.
 - **Critical point**: the $(m^*, t^*, \text{day type}^*)$ with the highest $p(\text{on})$ is found
@@ -18,7 +18,146 @@ implemented.)
 - **Monte Carlo**: for every connection count $N$ the number of active connections is
   $\text{Binomial}(N, p(\text{on}))$ and each active load is drawn from the truncated Gaussian.
 - **Outputs**: percentiles (default 50/95/99) of total load and load per connection, the
-  $N \to \infty$ expectation $E[P] \cdot p(\text{on})$, a CSV, a JSON metadata sidecar and a plot.
+  $N \to \infty$ expectation $E[P_{\text{active}}] \cdot p(\text{on})$, a CSV, a JSON metadata sidecar and a plot.
+
+## Theory: Rusck's Simultaneity Model and the Gaussian Model
+
+This section explains how the Gaussian model reproduces Rusck's simultaneity curve, how
+$\mu$, $\sigma$ and $p$ shape it, and why the match only holds at the peak.
+
+### Notation
+
+All powers are expressed **in units of $P_{\max}$**, so $\mu$ and $\sigma$ are the
+`mu_ratio` and `sigma_ratio` of the code.
+
+| Symbol | Meaning |
+| --- | --- |
+| $N$ | number of connections |
+| $\mu,\ \sigma$ | location and scale of the active load (Gaussian truncated to $[0, 1]$) |
+| $p(t)$ | activation probability $p(\text{on})$ at time step $t$; $p$ without argument is its value at the peak (`--max-p-on`) |
+| $z$ | standard-normal quantile; $z_{0.99} \approx 2.326$ is the 99th percentile used throughout |
+| $g(N)$ | simultaneity at the peak: the 99th-percentile load of $N$ connections per connection; $g(N, t)$ at time step $t$ |
+| $s$ | asymptotic simultaneity $g(\infty)$ at the peak (`--simultaneity`) |
+
+The formulas below neglect truncation (they use $E[\text{load}] \approx \mu$ and
+$\mathrm{Var} \approx \sigma^2$) and use the normal approximation for sums. The Monte Carlo
+tables (40,000 runs per value) show the exact values.
+
+### 1. Rusck's curve
+
+$$
+g(N) = s + \frac{1 - s}{\sqrt{N}}
+$$
+
+A single connection reaches $P_{\max}$ ($g(1) = 1$). Large groups approach $s$.
+
+### 2. Simultaneity in the Gaussian model
+
+At the peak, a connection is on with probability $p$ and then draws a load from the truncated Gaussian.
+Otherwise its load is 0. Its mean is $p\mu$. Its variance has two parts:
+
+$$
+\mathrm{Var} = \underbrace{p\,\sigma^2}_{\text{spread while on}} + \underbrace{p(1-p)\,\mu^2}_{\text{on/off switching}} .
+$$
+
+The 99th percentile of the sum over $N$ connections, divided by $N$, is then
+
+$$
+g(N) \approx p\,\mu + \frac{z_{0.99} \sqrt{p\,\sigma^2 + p(1-p)\,\mu^2}}{\sqrt{N}} .
+$$
+
+This has Rusck's shape: a constant plus a term that decays like $1/\sqrt{N}$. The two curves are
+identical when
+
+$$
+p\,\mu = s \qquad\text{and}\qquad z_{0.99} \sqrt{p\,\sigma^2 + p(1-p)\,\mu^2} = 1 - s .
+$$
+
+### 3. Fitting at the peak
+
+`--from-year-profile` sets
+
+$$
+\mu = \frac{s}{p}, \qquad \sigma = \frac{1 - \mu}{z_{0.99}}, \qquad P_{\max} = \frac{P_{\text{peak}}}{s} .
+$$
+
+The first condition, $p\mu = s$, always holds. Whether the second holds depends on $p$.
+
+**$p = 1$: exact match.** No switching term remains, so $\mu = s$ and $z_{0.99}\,\sigma = 1 - s$.
+Monte Carlo check for $s = 0.7$:
+
+| $N$ | Rusck | Gaussian model |
+| ---: | ---: | ---: |
+| 1 | 1.000 | 0.966 |
+| 2 | 0.912 | 0.892 |
+| 5 | 0.834 | 0.824 |
+| 10 | 0.795 | 0.788 |
+| 50 | 0.742 | 0.737 |
+| 200 | 0.721 | 0.717 |
+
+The small gap for small $N$ comes from the truncation at $P_{\max}$.
+
+**$p < 1$: only the asymptote matches.** The switching variance makes the $1/\sqrt{N}$ term
+larger than $1 - s$. Even with $\sigma = 0$, the switching term alone exceeds $1 - s$ unless
+
+$$
+p \;\ge\; \frac{1}{1 + \left(\dfrac{1 - s}{z_{0.99}\, s}\right)^2} \qquad (\approx 0.967 \text{ for } s = 0.7) .
+$$
+
+Monte Carlo check for $s = 0.7$ and $p = 0.9$:
+
+| $N$ | Rusck | Gaussian model |
+| ---: | ---: | ---: |
+| 1 | 1.000 | 0.971 |
+| 10 | 0.795 | 0.831 |
+| 50 | 0.742 | 0.771 |
+| 200 | 0.721 | 0.736 |
+
+### 4. Effect of $\mu$, $\sigma$ and $p$
+
+| Parameter | Effect on $g(\infty) = p\,\mu$ | Effect on the $1/\sqrt{N}$ term |
+| --- | --- | --- |
+| $\mu$ | sets the level | grows through the switching term $p(1-p)\mu^2$ |
+| $\sigma$ | none | grows; sets how far small groups lie above the asymptote |
+| $p$ | lowers it linearly | adds the switching variance, largest at $p = 1/2$ |
+
+In short, $\mu$ and $p$ set the simultaneity of large groups. $\sigma$ and the on/off switching
+set how much higher small groups go.
+
+### 5. Away from the peak, the simultaneity is larger
+
+The model uses the same $\mu$ and $\sigma$ at every time step. Only the activation probability
+falls with the profile:
+
+$$
+p(t) = p \, \frac{P(t)}{P_{\text{peak}}} \;\le\; p .
+$$
+
+Fewer connections are on, but each one that is on still draws the full $\mu$. Fluctuations
+relative to the mean therefore grow. To compare time steps, divide the simultaneity by that time
+step's own asymptote $g(\infty, t) = p(t)\,\mu$:
+
+$$
+\frac{g(N, t)}{g(\infty, t)} \approx 1 + \frac{z_{0.99}}{\sqrt{N}} \sqrt{\frac{1 + \sigma^2/\mu^2}{p(t)} - 1} .
+$$
+
+This ratio decreases strictly as $p(t)$ grows. It is therefore smallest at the peak. For $p = 1$
+it equals Rusck's $g(N)/s = 1 + \frac{1 - s}{s\sqrt{N}}$ there, and it is larger at every other
+time step.
+
+Monte Carlo check of $g(N,t)/g(\infty,t)$ with $s = 0.7$ and $p = 1$:
+
+| $P(t)/P_{\text{peak}}$ | $N = 10$ | $N = 50$ | $N = 200$ |
+| ---: | ---: | ---: | ---: |
+| 1.00 (peak, = Rusck) | 1.13 | 1.06 | 1.03 |
+| 0.50 | 1.75 | 1.34 | 1.17 |
+| 0.25 | 2.44 | 1.61 | 1.30 |
+
+**What this means:** the fitted model reproduces Rusck's simultaneity only at the critical time
+step. At every other time step, a group of $N$ connections has a higher peak relative to its
+mean demand than Rusck's curve predicts. Scaling the peak-time result down by
+$P(t)/P_{\text{peak}}$ therefore underestimates off-peak group peaks. The simulation evaluates
+only the critical time step, where the match holds by construction.
 
 ## Setup
 
@@ -73,16 +212,17 @@ grid-gmm \
   --save-config results/my_fitted_config.json
 ```
 
-With target simultaneity $s$ and peak activation probability $p_{\text{peak}}$ (`--max-p-on`):
+With target simultaneity $s$ and peak activation probability $p$ (`--max-p-on`):
 
-- $P_{\text{max}} = P_{\text{peak}} / s$
-- $\mu_{\text{ratio}} = s / p_{\text{peak}}$ (so $\mu \cdot p_{\text{peak}} = P_{\text{peak}}$)
-- $\sigma_{\text{ratio}} = (1 - \mu_{\text{ratio}}) / z_{0.99}$ (so $\mu + z_{0.99}\sigma = P_{\text{max}}$)
-- $p(\text{on}, t) = p_{\text{peak}} \cdot P(t) / P_{\text{peak}}$, split into 12 month factors and
+- $P_{\max} = P_{\text{peak}} / s$
+- $\mu_{\text{ratio}} = s / p$ (so $\mu \cdot p = P_{\text{peak}}$)
+- $\sigma_{\text{ratio}} = (1 - \mu_{\text{ratio}}) / z_{0.99}$ (so $\mu + z_{0.99}\sigma = P_{\max}$)
+- $p(t) = p \cdot P(t) / P_{\text{peak}}$, split into 12 month factors and
   96 weekday/weekend interval factors
 
-`--mu-ratio` and `--sigma-ratio` override the derived values. `--p-max` cannot be used here,
-because $P_{\text{max}}$ is derived from the profile.
+See [Theory](#theory-ruscks-simultaneity-model-and-the-gaussian-model) for why these choices
+reproduce Rusck's curve exactly only when `--max-p-on 1.0`. `--mu-ratio` and `--sigma-ratio` override the derived values. `--p-max` cannot be used here,
+because $P_{\max}$ is derived from the profile.
 
 Input handling:
 
