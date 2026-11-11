@@ -57,20 +57,20 @@ At the peak, a connection is on with probability $p$ and then draws a load from 
 Otherwise its load is 0. Its mean is $p\mu$. Its variance has two parts:
 
 $$
-\mathrm{Var} = \underbrace{p\,\sigma^2}_{\text{spread while on}} + \underbrace{p(1-p)\,\mu^2}_{\text{on/off switching}} .
+\mathrm{Var} = \underbrace{p \sigma^2}_{\text{spread while on}} + \underbrace{p(1-p) \mu^2}_{\text{on/off switching}} .
 $$
 
 The 99th percentile of the sum over $N$ connections, divided by $N$, is then
 
 $$
-g(N) \approx p\,\mu + \frac{z_{0.99} \sqrt{p\,\sigma^2 + p(1-p)\,\mu^2}}{\sqrt{N}} .
+g(N) \approx p \mu + \frac{z_{0.99} \sqrt{p \sigma^2 + p(1-p) \mu^2}}{\sqrt{N}} .
 $$
 
 This has Rusck's shape: a constant plus a term that decays like $1/\sqrt{N}$. The two curves are
 identical when
 
 $$
-p\,\mu = s \qquad\text{and}\qquad z_{0.99} \sqrt{p\,\sigma^2 + p(1-p)\,\mu^2} = 1 - s .
+p \mu = s \qquad\text{and}\qquad z_{0.99} \sqrt{p \sigma^2 + p(1-p) \mu^2} = 1 - s .
 $$
 
 ### 3. Fitting at the peak
@@ -83,7 +83,7 @@ $$
 
 The first condition, $p\mu = s$, always holds. Whether the second holds depends on $p$.
 
-**$p = 1$: exact match.** No switching term remains, so $\mu = s$ and $z_{0.99}\,\sigma = 1 - s$.
+**$p = 1$: exact match.** No switching term remains, so $\mu = s$ and $z_{0.99} \sigma = 1 - s$.
 Monte Carlo check for $s = 0.7$:
 
 | $N$ | Rusck | Gaussian model |
@@ -101,7 +101,7 @@ The small gap for small $N$ comes from the truncation at $P_{\max}$.
 larger than $1 - s$. Even with $\sigma = 0$, the switching term alone exceeds $1 - s$ unless
 
 $$
-p \;\ge\; \frac{1}{1 + \left(\dfrac{1 - s}{z_{0.99}\, s}\right)^2} \qquad (\approx 0.967 \text{ for } s = 0.7) .
+p \ge \frac{1}{1 + \left(\dfrac{1 - s}{z_{0.99} s}\right)^2} \qquad (\approx 0.967 \text{ for } s = 0.7) .
 $$
 
 Monte Carlo check for $s = 0.7$ and $p = 0.9$:
@@ -115,7 +115,7 @@ Monte Carlo check for $s = 0.7$ and $p = 0.9$:
 
 ### 4. Effect of $\mu$, $\sigma$ and $p$
 
-| Parameter | Effect on $g(\infty) = p\,\mu$ | Effect on the $1/\sqrt{N}$ term |
+| Parameter | Effect on $g(\infty) = p \mu$ | Effect on the $1/\sqrt{N}$ term |
 | --- | --- | --- |
 | $\mu$ | sets the level | grows through the switching term $p(1-p)\mu^2$ |
 | $\sigma$ | none | grows; sets how far small groups lie above the asymptote |
@@ -130,12 +130,12 @@ The model uses the same $\mu$ and $\sigma$ at every time step. Only the activati
 falls with the profile:
 
 $$
-p(t) = p \, \frac{P(t)}{P_{\text{peak}}} \;\le\; p .
+p(t) = p \frac{P(t)}{P_{\text{peak}}} \le p .
 $$
 
 Fewer connections are on, but each one that is on still draws the full $\mu$. Fluctuations
 relative to the mean therefore grow. To compare time steps, divide the simultaneity by that time
-step's own asymptote $g(\infty, t) = p(t)\,\mu$:
+step's own asymptote $g(\infty, t) = p(t) \mu$:
 
 $$
 \frac{g(N, t)}{g(\infty, t)} \approx 1 + \frac{z_{0.99}}{\sqrt{N}} \sqrt{\frac{1 + \sigma^2/\mu^2}{p(t)} - 1} .
