@@ -1,0 +1,40 @@
+{
+  "component": {
+    "name": "Heat Pump Terrace Archetype (binary on/off)",
+    "p_max_kw": 2.5614214285714287,
+    "mu_ratio": 1.0,
+    "sigma_ratio": 0.0,
+    "mu_kw": 2.5614214285714287,
+    "sigma_kw": 0.0,
+    "mean_active_kw": 2.5614214285714287
+  },
+  "critical_point": {
+    "month": 1,
+    "month_name": "January",
+    "day_type": "weekend",
+    "interval_idx": 24,
+    "time": "06:00",
+    "p_on": 0.7000000000000001,
+    "month_factor": 3.0935594096445014,
+    "interval_factor": 0.22627656602219287
+  },
+  "expected_load_per_conn_kw": 1.7929950000000003,
+  "num_runs": 1000,
+  "percentiles": [
+    50.0,
+    95.0,
+    99.0
+  ],
+  "connections": [
+    1,
+    2,
+    5,
+    10,
+    15,
+    20,
+    30,
+    50,
+    100,
+    200
+  ]
+}

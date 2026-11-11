@@ -1,157 +1,174 @@
-"""Unit tests for profile_fitter module."""
+"""Unit tests for the profile_fitter module."""
 
 import csv
-from datetime import datetime, timedelta
 from pathlib import Path
+
 import numpy as np
 import pytest
 
+from conftest import write_profile_csv
+from grid_gmm.constants import Z_99
 from grid_gmm.profile_fitter import (
+    convert_w_profile_to_kw_csv,
+    derive_component,
     fit_gm_from_year_profile,
     load_year_profile_csv,
 )
 from grid_gmm.simulation import MonteCarloEngine
 
 
-def _create_synthetic_csv(path: Path, num_days: int = 14) -> None:
-    """Helper to generate a realistic two-column CSV for testing."""
-    start_time = datetime(2024, 1, 1, 0, 0, 0)
-    rows = [["timestamp", "consumption_kw"]]
-
-    # Generate 15-min intervals for num_days
-    total_steps = num_days * 96
-    for step in range(total_steps):
-        dt = start_time + timedelta(minutes=15 * step)
-        # Power base pattern: evening peak around 19:00 (step % 96 == 76)
-        interval_idx = step % 96
-        base = 0.5
-        if 28 <= interval_idx <= 36:  # 07:00 - 09:00
-            base = 1.8
-        elif 72 <= interval_idx <= 84:  # 18:00 - 21:00
-            base = 3.5  # peak
-        # Add small deterministic variation
-        power = base + 0.1 * np.sin(step)
-        rows.append([dt.strftime("%Y-%m-%d %H:%M:%S"), f"{power:.3f}"])
-
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerows(rows)
+def test_load_year_profile_csv(profile_csv: Path):
+    profile = load_year_profile_csv(profile_csv)
+    n = 14 * 96
+    assert len(profile) == n
+    assert profile.months.shape == profile.is_weekend.shape == profile.interval_idx.shape == (n,)
+    assert np.all((profile.months >= 1) & (profile.months <= 12))
+    assert np.all((profile.interval_idx >= 0) & (profile.interval_idx < 96))
+    assert np.all(profile.power_kw >= 0.0)
+    assert np.any(profile.is_weekend)
+    assert profile.source_unit == "kW"
+    assert profile.source_resolution_minutes == 15
 
 
-def test_load_year_profile_csv(tmp_path: Path):
-    csv_file = tmp_path / "test_profile.csv"
-    _create_synthetic_csv(csv_file, num_days=7)
-
-    months, is_weekends, intervals, consumptions = load_year_profile_csv(csv_file)
-
-    assert len(months) == 7 * 96
-    assert len(is_weekends) == 7 * 96
-    assert len(intervals) == 7 * 96
-    assert len(consumptions) == 7 * 96
-
-    assert np.all((months >= 1) & (months <= 12))
-    assert np.all((intervals >= 0) & (intervals < 96))
-    assert np.all(consumptions >= 0.0)
-    assert np.any(is_weekends)  # 7 days includes Saturday and Sunday
+def test_watt_profile_is_detected_and_converted(tmp_path: Path):
+    kw = load_year_profile_csv(write_profile_csv(tmp_path / "kw.csv"))
+    with pytest.warns(UserWarning, match="assuming values are in W"):
+        w = load_year_profile_csv(write_profile_csv(tmp_path / "w.csv", scale=1000.0))
+    assert w.source_unit == "W"
+    np.testing.assert_allclose(w.power_kw, kw.power_kw, atol=1e-3)
 
 
-def test_fit_gm_from_year_profile(tmp_path: Path):
-    csv_file = tmp_path / "test_profile.csv"
-    _create_synthetic_csv(csv_file, num_days=14)
+def test_peak_at_threshold_stays_kw(tmp_path: Path):
+    path = tmp_path / "p.csv"
+    path.write_text("timestamp,consumption_kw\n2024-01-01 00:00,20.0\n2024-01-01 00:15,1.0\n")
+    assert load_year_profile_csv(path).source_unit == "kW"
 
+
+@pytest.mark.parametrize("step_minutes", [30, 60])
+def test_coarse_profiles_are_expanded_to_15_minutes(tmp_path: Path, step_minutes: int):
+    path = write_profile_csv(tmp_path / "coarse.csv", num_days=7, step_minutes=step_minutes)
+    profile = load_year_profile_csv(path)
+    assert profile.source_resolution_minutes == step_minutes
+    assert len(profile) == 7 * 96
+    np.testing.assert_array_equal(profile.interval_idx[:4], [0, 1, 2, 3])
+    # Energy is preserved by the expansion
+    rows = list(csv.reader(path.open()))[1:]
+    expected_kwh = sum(float(r[1]) for r in rows) * step_minutes / 60
+    assert profile.energy_kwh == pytest.approx(expected_kwh)
+
+
+def test_unsupported_resolution_raises(tmp_path: Path):
+    path = write_profile_csv(tmp_path / "p.csv", num_days=1, step_minutes=20)
+    with pytest.raises(ValueError, match="Unsupported profile resolution"):
+        load_year_profile_csv(path)
+
+
+def test_headerless_and_named_value_column(tmp_path: Path):
+    headerless = write_profile_csv(tmp_path / "nohdr.csv", num_days=1, header=None)
+    assert len(load_year_profile_csv(headerless)) == 96
+
+    multi = tmp_path / "multi.csv"
+    multi.write_text("ts,a_kw,b_kw\n2024-01-01 00:00,1.0,2.0\n2024-01-01 00:15,1.5,4.0\n")
+    assert load_year_profile_csv(multi).peak_kw == 1.5  # column 1 by default
+    assert load_year_profile_csv(multi, value_column="b_kw").peak_kw == 4.0
+    assert load_year_profile_csv(multi, value_column=2).peak_kw == 4.0
+    with pytest.raises(ValueError, match="not found in CSV header"):
+        load_year_profile_csv(multi, value_column="missing")
+
+
+def test_negative_values_are_clipped_with_single_warning(tmp_path: Path):
+    path = tmp_path / "neg.csv"
+    path.write_text("timestamp,kw\n2024-01-01 00:00,-1\n2024-01-01 00:15,-2\n2024-01-01 00:30,3\n")
+    with pytest.warns(UserWarning, match="2 negative power value"):
+        profile = load_year_profile_csv(path)
+    np.testing.assert_array_equal(profile.power_kw, [0.0, 0.0, 3.0])
+
+
+def test_timezone_conversion(tmp_path: Path):
+    path = tmp_path / "utc.csv"
+    path.write_text("timestamp,kw\n2024-07-01 18:00:00+00:00,1\n2024-07-01 18:15:00+00:00,2\n")
+    assert load_year_profile_csv(path).interval_idx.tolist() == [72, 73]  # wall clock as written
+    berlin = load_year_profile_csv(path, timezone="Europe/Berlin")  # UTC+2 in summer
+    assert berlin.interval_idx.tolist() == [80, 81]
+
+
+def test_unparseable_row_reports_line_number(tmp_path: Path):
+    path = tmp_path / "bad.csv"
+    path.write_text("timestamp,kw\n2024-01-01 00:00,1\nnot-a-date,2\n")
+    with pytest.raises(ValueError, match="row 3"):
+        load_year_profile_csv(path)
+
+
+def test_fit_gm_from_year_profile(profile_csv: Path):
     simultaneity = 0.35
-    mu_ratio = 0.5
-    sigma_ratio = 0.2
+    component, factors, summary = fit_gm_from_year_profile(profile_csv, simultaneity=simultaneity, max_p_on=0.90)
 
-    # Test with max_p_on=0.90
-    component, factors, summary = fit_gm_from_year_profile(
-        csv_path=csv_file,
-        simultaneity=simultaneity,
-        max_p_on=0.90,
-    )
-
-    # 1. P_max = P_peak / simultaneity
     assert summary.p_peak > 0
     assert component.p_max == pytest.approx(summary.p_peak / simultaneity)
-    assert component.mu_ratio == pytest.approx(simultaneity / 0.90, rel=1e-3)
-    assert component.mu == pytest.approx(summary.p_peak / 0.90, rel=1e-3)
-
-    # 2. Peak activation probability is 0.90 at peak
+    assert component.mu_ratio == pytest.approx(simultaneity / 0.90)
+    assert component.mu == pytest.approx(summary.p_peak / 0.90)
     assert summary.peak_p_on == pytest.approx(0.90)
 
-    # 3. Factor dimensions
-    assert len(factors.month_factors) == 12
-    assert len(factors.weekday_factors) == 96
-    assert len(factors.weekend_factors) == 96
     assert np.all(factors.month_factors >= 0)
-    assert np.all(factors.weekday_factors >= 0)
-    assert np.all(factors.weekend_factors >= 0)
-
-    # 4. Critical point should match peak p(on) = 0.90
     cp = factors.find_critical_point()
-    assert cp.p_on == pytest.approx(0.90, rel=1e-2)
+    assert cp.p_on == pytest.approx(0.90)
+    assert component.mu * cp.p_on == pytest.approx(summary.p_peak)
 
-    # 5. Fleet expectation as N -> inf matches P_peak
-    assert (component.mu * cp.p_on) == pytest.approx(summary.p_peak, rel=1e-2)
-
-    # Test with default max_p_on=1.0
-    comp1, fac1, summ1 = fit_gm_from_year_profile(
-        csv_path=csv_file,
-        simultaneity=simultaneity,
-    )
+    comp1, _, summ1 = fit_gm_from_year_profile(profile_csv, simultaneity=simultaneity)
     assert summ1.peak_p_on == pytest.approx(1.0)
-    assert comp1.mu_ratio == pytest.approx(simultaneity, rel=1e-3)
-    # 99th percentile upper reach: mu + 2.32635 * sigma should equal P_max
-    p99_single = comp1.mu + 2.32635 * comp1.sigma
-    assert p99_single == pytest.approx(comp1.p_max, rel=1e-2)
+    assert comp1.mu_ratio == pytest.approx(simultaneity)
+    assert comp1.mu + Z_99 * comp1.sigma == pytest.approx(comp1.p_max)
+
+
+def test_fit_from_watt_profile_matches_kw_profile(tmp_path: Path):
+    kw_comp, _, _ = fit_gm_from_year_profile(write_profile_csv(tmp_path / "kw.csv"), simultaneity=0.5)
+    with pytest.warns(UserWarning):
+        w_comp, _, w_summary = fit_gm_from_year_profile(
+            write_profile_csv(tmp_path / "w.csv", scale=1000.0), simultaneity=0.5
+        )
+    assert w_summary.source_unit == "W"
+    assert w_comp.p_max == pytest.approx(kw_comp.p_max, rel=1e-3)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"simultaneity": 0.0}, "Simultaneity"),
+        ({"simultaneity": 0.5, "max_p_on": 1.5}, "max_p_on"),
+        ({"simultaneity": 0.9, "max_p_on": 0.5}, "simultaneity <= max_p_on"),
+    ],
+)
+def test_derive_component_validation(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        derive_component(p_peak=1.0, **kwargs)
 
 
 def test_convert_w_profile_to_kw_csv(tmp_path: Path):
-    from grid_gmm.profile_fitter import convert_w_profile_to_kw_csv
-
-    # Create dummy source with Watts
     src_csv = tmp_path / "src_watts.csv"
-    with open(src_csv, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["datetime_utc", "archetype_w", "admd_scaled_w_per_hp"])
-        writer.writerow(["2000-01-01 00:00:00+00:00", "500.0", "750.0"])
-        writer.writerow(["2000-01-01 01:00:00+00:00", "600.0", "900.0"])
-
+    src_csv.write_text(
+        "datetime_utc,archetype_w,admd_scaled_w_per_hp\n"
+        "2000-01-01 00:00:00+00:00,500.0,750.0\n"
+        "2000-01-01 01:00:00+00:00,600.0,900.0\n"
+    )
     out_csv = tmp_path / "out_kw.csv"
-    res_path = convert_w_profile_to_kw_csv(src_csv, out_csv, value_column="admd_scaled_w_per_hp", expand_to_15min=True)
-    assert res_path.exists()
+    assert convert_w_profile_to_kw_csv(src_csv, out_csv, value_column="admd_scaled_w_per_hp").exists()
 
-    with open(out_csv, "r") as f:
-        reader = csv.reader(f)
-        header = next(reader)
-        assert header == ["timestamp", "consumption_kw"]
-        rows = list(reader)
-        # 2 hours expanded to 15-min -> 8 rows
-        assert len(rows) == 8
-        # 750 W -> 0.75 kW
-        assert float(rows[0][1]) == pytest.approx(0.75)
+    with open(out_csv) as f:
+        rows = list(csv.reader(f))
+    assert rows[0] == ["timestamp", "consumption_kw"]
+    assert len(rows) == 1 + 8  # 2 hours -> 8 quarter hours
+    assert float(rows[1][1]) == pytest.approx(0.75)
+    assert rows[2][0] == "2000-01-01 00:15:00+00:00"  # timezone offset preserved
+
+    with pytest.raises(ValueError, match="not found"):
+        convert_w_profile_to_kw_csv(src_csv, out_csv, value_column="nope")
 
 
-def test_fit_gm_end_to_end_simulation(tmp_path: Path):
-    csv_file = tmp_path / "test_profile.csv"
-    _create_synthetic_csv(csv_file, num_days=14)
-
-    component, factors, _ = fit_gm_from_year_profile(
-        csv_path=csv_file,
-        simultaneity=0.7,
-        mu_ratio=0.5,
-        sigma_ratio=0.2,
+def test_fit_gm_end_to_end_simulation(profile_csv: Path):
+    component, factors, _ = fit_gm_from_year_profile(profile_csv, simultaneity=0.7, mu_ratio=0.5, sigma_ratio=0.2)
+    results = MonteCarloEngine(component, factors, seed=123).run_critical_time_simulation(
+        connection_counts=[1, 5, 20], num_runs=50
     )
-
-    engine = MonteCarloEngine(component=component, factors=factors, seed=123)
-    results = engine.run_critical_time_simulation(
-        connection_counts=[1, 5, 20],
-        num_runs=50,
-        percentiles=[50.0, 95.0, 99.0],
-    )
-
     assert results.component.mu_ratio == 0.5
     assert results.component.sigma_ratio == 0.2
-    assert len(results.connections) == 3
-    # Check percentile monotonicity
     assert results.p_per_conn[50.0][0] <= results.p_per_conn[95.0][0] <= results.p_per_conn[99.0][0]

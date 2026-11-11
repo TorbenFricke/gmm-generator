@@ -1,145 +1,124 @@
-"""Factor profiles and critical time calculation for grid load activation probability p(on)."""
+"""Factor profiles and critical-time calculation for the activation probability p(on)."""
+
+from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence, Tuple, Union
+
 import numpy as np
+from numpy.typing import ArrayLike
+
+from grid_gmm.constants import (
+    INTERVAL_MINUTES,
+    INTERVALS_PER_DAY,
+    MONTH_NAMES,
+    MONTHS_PER_YEAR,
+    DayType,
+)
+
+#: Order of the day-type axis in stacked (day_type, month, interval) arrays.
+_DAY_TYPE_ORDER = (DayType.WEEKDAY, DayType.WEEKEND)
 
 
-@dataclass
+def interval_to_time_str(interval_idx: int) -> str:
+    """Convert an interval index of the day (0-95) to an 'HH:MM' string."""
+    if not (0 <= interval_idx < INTERVALS_PER_DAY):
+        raise ValueError(f"Interval index must be 0-{INTERVALS_PER_DAY - 1}, got {interval_idx}")
+    hours, minutes = divmod(interval_idx * INTERVAL_MINUTES, 60)
+    return f"{hours:02d}:{minutes:02d}"
+
+
+@dataclass(frozen=True)
 class CriticalPoint:
-    """Represents the most critical point in time (highest p(on))."""
+    """The point in time with the highest activation probability p(on)."""
 
     month: int  # 1 to 12
-    month_name: str
-    day_type: str  # "weekday" or "weekend"
+    day_type: DayType
     interval_idx: int  # 0 to 95
-    time_str: str  # e.g., "19:15"
     p_on: float
     month_factor: float
     interval_factor: float
 
+    @property
+    def month_name(self) -> str:
+        return MONTH_NAMES[self.month - 1]
 
-@dataclass
+    @property
+    def time_str(self) -> str:
+        return interval_to_time_str(self.interval_idx)
+
+
+@dataclass(frozen=True, eq=False)  # eq=False: element-wise array comparison has no single truth value
 class FactorProfiles:
-    """Holds the 12 month factors and 96 15-minute interval factors for weekdays and weekends.
+    """Separable p(on) model: ``p(on) = month_factor[m] * interval_factor[day_type][t]``, clipped to [0, 1].
 
     Attributes:
-        month_factors: 12 factors for months Jan (index 0) to Dec (index 11).
-        weekday_factors: 96 factors for 15-minute intervals across a weekday (00:00 to 23:45).
-        weekend_factors: 96 factors for 15-minute intervals across a weekend day (00:00 to 23:45).
+        month_factors: 12 factors for January (index 0) to December (index 11).
+        weekday_factors: 96 factors for 15-minute intervals of a weekday (00:00 to 23:45).
+        weekend_factors: 96 factors for 15-minute intervals of a weekend day (00:00 to 23:45).
+
+    The arrays are copied and made read-only on construction.
     """
 
-    month_factors: Sequence[float]
-    weekday_factors: Sequence[float]
-    weekend_factors: Sequence[float]
+    month_factors: np.ndarray
+    weekday_factors: np.ndarray
+    weekend_factors: np.ndarray
 
-    MONTH_NAMES = (
-        "January",
-        "February",
-        "March",
-        "April",
-        "May",
-        "June",
-        "July",
-        "August",
-        "September",
-        "October",
-        "November",
-        "December",
-    )
+    def __init__(
+        self,
+        month_factors: ArrayLike,
+        weekday_factors: ArrayLike,
+        weekend_factors: ArrayLike,
+    ) -> None:
+        specs = (
+            ("month_factors", month_factors, MONTHS_PER_YEAR, "month factors"),
+            ("weekday_factors", weekday_factors, INTERVALS_PER_DAY, "weekday interval factors"),
+            ("weekend_factors", weekend_factors, INTERVALS_PER_DAY, "weekend interval factors"),
+        )
+        for attr, values, expected_len, label in specs:
+            arr = np.array(values, dtype=float)
+            if arr.shape != (expected_len,):
+                raise ValueError(f"Expected {expected_len} {label}, got {arr.size}")
+            if not np.all(np.isfinite(arr)):
+                raise ValueError(f"{label.capitalize()} must be finite")
+            if np.any(arr < 0):
+                raise ValueError(f"{label.capitalize()} cannot be negative")
+            arr.setflags(write=False)
+            object.__setattr__(self, attr, arr)
 
-    def __post_init__(self):
-        self.month_factors = np.asarray(self.month_factors, dtype=float)
-        self.weekday_factors = np.asarray(self.weekday_factors, dtype=float)
-        self.weekend_factors = np.asarray(self.weekend_factors, dtype=float)
+    def interval_factors(self, day_type: DayType | str) -> np.ndarray:
+        """Return the 96 interval factors for the given day type."""
+        if DayType.parse(day_type) is DayType.WEEKDAY:
+            return self.weekday_factors
+        return self.weekend_factors
 
-        if len(self.month_factors) != 12:
-            raise ValueError(f"Expected 12 month factors, got {len(self.month_factors)}")
-        if len(self.weekday_factors) != 96:
-            raise ValueError(f"Expected 96 weekday interval factors, got {len(self.weekday_factors)}")
-        if len(self.weekend_factors) != 96:
-            raise ValueError(f"Expected 96 weekend interval factors, got {len(self.weekend_factors)}")
-
-        if np.any(self.month_factors < 0):
-            raise ValueError("Month factors cannot be negative")
-        if np.any(self.weekday_factors < 0):
-            raise ValueError("Weekday interval factors cannot be negative")
-        if np.any(self.weekend_factors < 0):
-            raise ValueError("Weekend interval factors cannot be negative")
-
-    @staticmethod
-    def interval_to_time_str(interval_idx: int) -> str:
-        """Convert a 15-minute interval index (0-95) to 'HH:MM' string."""
-        if not (0 <= interval_idx < 96):
-            raise ValueError(f"Interval index must be 0-95, got {interval_idx}")
-        total_minutes = interval_idx * 15
-        hours = total_minutes // 60
-        minutes = total_minutes % 60
-        return f"{hours:02d}:{minutes:02d}"
-
-    def calculate_p_on(self, month: int, interval_idx: int, day_type: str) -> float:
-        """Calculate p(on) for a specific month, interval, and day type clipped to [0, 1].
-
-        Args:
-            month: 1 to 12
-            interval_idx: 0 to 95
-            day_type: 'weekday' or 'weekend'
-        """
-        if not (1 <= month <= 12):
+    def calculate_p_on(self, month: int, interval_idx: int, day_type: DayType | str) -> float:
+        """Calculate p(on) for a month (1-12), interval (0-95) and day type, clipped to [0, 1]."""
+        if not (1 <= month <= MONTHS_PER_YEAR):
             raise ValueError(f"Month must be 1-12, got {month}")
-        if not (0 <= interval_idx < 96):
-            raise ValueError(f"Interval must be 0-95, got {interval_idx}")
+        if not (0 <= interval_idx < INTERVALS_PER_DAY):
+            raise ValueError(f"Interval must be 0-{INTERVALS_PER_DAY - 1}, got {interval_idx}")
 
-        m_factor = self.month_factors[month - 1]
-        if day_type.lower() == "weekday":
-            i_factor = self.weekday_factors[interval_idx]
-        elif day_type.lower() == "weekend":
-            i_factor = self.weekend_factors[interval_idx]
-        else:
-            raise ValueError(f"Unknown day_type '{day_type}', must be 'weekday' or 'weekend'")
+        raw = self.month_factors[month - 1] * self.interval_factors(day_type)[interval_idx]
+        return float(np.clip(raw, 0.0, 1.0))
 
-        return float(np.clip(m_factor * i_factor, 0.0, 1.0))
+    def raw_products(self) -> np.ndarray:
+        """Unclipped factor products with shape (day_type, month, interval) = (2, 12, 96)."""
+        return np.stack([np.outer(self.month_factors, self.interval_factors(dt)) for dt in _DAY_TYPE_ORDER])
 
     def find_critical_point(self) -> CriticalPoint:
-        """Identify the most critical point in time ahead of the Monte Carlo simulation.
+        """Identify the (month, day type, interval) that maximizes p(on).
 
-        The critical point is the (month, day_type, interval) that maximizes p(on),
-        representing the highest probability of peak grid demand.
-
-        Returns:
-            CriticalPoint dataclass with the peak time and p(on).
+        Ties are resolved in favour of weekdays, then earlier months, then earlier intervals.
         """
-        # Outer product: 12 x 96 for weekday and weekend
-        p_weekday = np.outer(self.month_factors, self.weekday_factors)
-        p_weekend = np.outer(self.month_factors, self.weekend_factors)
-
-        max_weekday = np.max(p_weekday)
-        max_weekend = np.max(p_weekend)
-
-        if max_weekday >= max_weekend:
-            day_type = "weekday"
-            idx_2d = np.unravel_index(np.argmax(p_weekday), p_weekday.shape)
-            raw_p = float(p_weekday[idx_2d])
-            m_factor = float(self.month_factors[idx_2d[0]])
-            i_factor = float(self.weekday_factors[idx_2d[1]])
-        else:
-            day_type = "weekend"
-            idx_2d = np.unravel_index(np.argmax(p_weekend), p_weekend.shape)
-            raw_p = float(p_weekend[idx_2d])
-            m_factor = float(self.month_factors[idx_2d[0]])
-            i_factor = float(self.weekend_factors[idx_2d[1]])
-
-        month = int(idx_2d[0] + 1)
-        interval_idx = int(idx_2d[1])
-        p_on = float(np.clip(raw_p, 0.0, 1.0))
+        products = self.raw_products()
+        day_idx, month_idx, interval_idx = (int(i) for i in np.unravel_index(np.argmax(products), products.shape))
+        day_type = _DAY_TYPE_ORDER[day_idx]
 
         return CriticalPoint(
-            month=month,
-            month_name=self.MONTH_NAMES[month - 1],
+            month=month_idx + 1,
             day_type=day_type,
             interval_idx=interval_idx,
-            time_str=self.interval_to_time_str(interval_idx),
-            p_on=p_on,
-            month_factor=m_factor,
-            interval_factor=i_factor,
+            p_on=float(np.clip(products[day_idx, month_idx, interval_idx], 0.0, 1.0)),
+            month_factor=float(self.month_factors[month_idx]),
+            interval_factor=float(self.interval_factors(day_type)[interval_idx]),
         )

@@ -1,23 +1,90 @@
-"""Module for extracting Gaussian Model parameters and factor profiles from an annual load profile."""
+"""Derive Gaussian model parameters and factor profiles from an annual load profile.
+
+Pipeline:
+    1. :func:`load_year_profile_csv` reads a ``timestamp, value`` CSV into a :class:`YearProfile`
+       (unit detection, timezone conversion, resampling to 15-minute intervals).
+    2. :func:`derive_component` derives the :class:`GaussianComponent` from the profile peak (Rusck).
+    3. :func:`decompose_factors` decomposes the profile into month and interval factors.
+    4. :func:`fit_from_profile` / :func:`fit_gm_from_year_profile` combine the steps.
+"""
+
+from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import List, Optional, Tuple, Union
 import warnings
+from dataclasses import dataclass
+from datetime import datetime, timedelta, tzinfo
+from pathlib import Path
+from typing import Optional, Union
+from zoneinfo import ZoneInfo
+
 import numpy as np
+from dateutil import parser as date_parser
 
-try:
-    from dateutil import parser as date_parser
-except ImportError:
-    date_parser = None
-
+from grid_gmm.constants import (
+    INTERVAL_HOURS,
+    INTERVAL_MINUTES,
+    INTERVALS_PER_DAY,
+    KW_PEAK_THRESHOLD,
+    MONTHS_PER_YEAR,
+    Z_99,
+)
 from grid_gmm.factors import FactorProfiles
 from grid_gmm.model import GaussianComponent
 
+PathLike = Union[str, Path]
+ValueColumn = Optional[Union[str, int]]
 
-@dataclass
+#: Resolutions (minutes) that can be expanded to the 15-minute model resolution.
+SUPPORTED_RESOLUTIONS = (15, 30, 60)
+#: Column picked automatically when the CSV has a header but no column is specified.
+DEFAULT_VALUE_COLUMN_NAME = "consumption_kw"
+
+_TIMESTAMP_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%d.%m.%Y %H:%M:%S",
+    "%d.%m.%Y %H:%M",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M",
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y %H:%M",
+)
+
+
+@dataclass(frozen=True, eq=False)
+class YearProfile:
+    """A load profile at 15-minute resolution, as aligned NumPy arrays.
+
+    Attributes:
+        months: Month of each interval (1-12).
+        is_weekend: True for Saturday/Sunday.
+        interval_idx: Interval of the day (0-95).
+        power_kw: Average power in kW.
+        source_resolution_minutes: Resolution of the source data before expansion.
+        source_unit: "kW" or "W" (as detected from the profile peak).
+    """
+
+    months: np.ndarray
+    is_weekend: np.ndarray
+    interval_idx: np.ndarray
+    power_kw: np.ndarray
+    source_resolution_minutes: int = INTERVAL_MINUTES
+    source_unit: str = "kW"
+
+    def __len__(self) -> int:
+        return len(self.power_kw)
+
+    @property
+    def peak_kw(self) -> float:
+        return float(np.max(self.power_kw))
+
+    @property
+    def energy_kwh(self) -> float:
+        return float(np.sum(self.power_kw) * INTERVAL_HOURS)
+
+
+@dataclass(frozen=True)
 class ProfileFitSummary:
     """Summary of parameters derived from the annual load profile."""
 
@@ -29,351 +96,341 @@ class ProfileFitSummary:
     peak_p_on: float
     annual_energy_kwh: float
     total_records: int
+    source_unit: str = "kW"
+    source_resolution_minutes: int = INTERVAL_MINUTES
+
+
+# --------------------------------------------------------------------------------------
+# CSV parsing
+# --------------------------------------------------------------------------------------
 
 
 def _parse_timestamp(ts_str: str) -> datetime:
-    """Parse timestamp string using ISO format or dateutil parser."""
+    """Parse a timestamp using ISO 8601, a list of common formats, or dateutil as fallback."""
     ts_str = ts_str.strip()
-    # Try ISO8601 first (fastest)
     try:
         return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
     except ValueError:
         pass
 
-    # Common formats
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%d.%m.%Y %H:%M:%S",
-        "%d.%m.%Y %H:%M",
-        "%Y/%m/%d %H:%M:%S",
-        "%Y/%m/%d %H:%M",
-        "%m/%d/%Y %H:%M:%S",
-        "%m/%d/%Y %H:%M",
-    ):
+    for fmt in _TIMESTAMP_FORMATS:
         try:
             return datetime.strptime(ts_str, fmt)
         except ValueError:
             pass
 
-    if date_parser is not None:
+    try:
         return date_parser.parse(ts_str)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError(f"Unable to parse timestamp: '{ts_str}'") from exc
 
-    raise ValueError(f"Unable to parse timestamp: '{ts_str}'")
+
+def _is_number(value: str) -> bool:
+    try:
+        float(value)
+    except ValueError:
+        return False
+    return True
 
 
-def load_year_profile_csv(
-    filepath: Union[str, Path],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Parse a two-column CSV containing timestamp and consumption in kW.
+def _resolve_value_column(header: list[str] | None, value_column: ValueColumn) -> int:
+    """Return the index of the value column; raises if a named column does not exist."""
+    if value_column is None:
+        if header and DEFAULT_VALUE_COLUMN_NAME in header:
+            return header.index(DEFAULT_VALUE_COLUMN_NAME)
+        return 1
+    if isinstance(value_column, int) or str(value_column).isdigit():
+        return int(value_column)
+    if header is None:
+        raise ValueError(f"Column '{value_column}' requested, but the CSV has no header row")
+    if value_column not in header:
+        raise ValueError(f"Column '{value_column}' not found in CSV header {header}")
+    return header.index(value_column)
 
-    Args:
-        filepath: Path to the CSV file.
 
-    Returns:
-        Tuple of (months, is_weekends, interval_indices, consumptions) as NumPy arrays:
-        - months: 1 to 12
-        - is_weekends: boolean (True for Saturday/Sunday)
-        - interval_indices: 0 to 95 (15-minute interval index of day)
-        - consumptions: float power in kW
-    """
-    path = Path(filepath)
+def _read_timestamp_value_rows(path: Path, value_column: ValueColumn) -> tuple[list[datetime], np.ndarray]:
+    """Read (timestamp, value) pairs from column 0 and the selected value column."""
     if not path.is_file():
         raise FileNotFoundError(f"Profile file not found: {path}")
 
-    months: List[int] = []
-    is_weekends: List[bool] = []
-    interval_indices: List[int] = []
-    consumptions: List[float] = []
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        numbered_rows = [(line_no, row) for line_no, row in enumerate(csv.reader(f), start=1) if row]
 
-    with open(path, "r", encoding="utf-8-sig") as f:
-        reader = csv.reader(f)
-        first_row = next(reader, None)
-        if first_row is None:
-            raise ValueError(f"CSV file is empty: {path}")
+    if not numbered_rows:
+        raise ValueError(f"CSV file is empty: {path}")
 
-        # Check if first row is header
-        start_row = 0
-        try:
-            float(first_row[1])
-            has_header = False
-            rows = [first_row]
-        except (ValueError, IndexError):
-            has_header = True
-            rows = []
+    first_row = numbered_rows[0][1]
+    has_header = len(first_row) < 2 or not _is_number(first_row[1])
+    header = [cell.strip() for cell in first_row] if has_header else None
+    col_idx = _resolve_value_column(header, value_column)
+    data_rows = numbered_rows[1:] if has_header else numbered_rows
 
-        # Read remaining rows
-        for row in reader:
-            if row and len(row) >= 2:
-                rows.append(row)
-
-    if not rows:
-        raise ValueError(f"No valid data rows found in {path}")
-
-    for row_idx, row in enumerate(rows, start=2 if has_header else 1):
-        if len(row) < 2:
+    timestamps: list[datetime] = []
+    values: list[float] = []
+    for line_no, row in data_rows:
+        if len(row) <= col_idx:
             continue
-        ts_str, val_str = row[0].strip(), row[1].strip()
+        ts_str, val_str = row[0].strip(), row[col_idx].strip()
         if not ts_str or not val_str:
             continue
-
         try:
-            dt = _parse_timestamp(ts_str)
-            val = float(val_str)
-        except Exception as e:
-            raise ValueError(f"Error parsing row {row_idx} ({row}): {e}") from e
+            timestamps.append(_parse_timestamp(ts_str))
+            values.append(float(val_str))
+        except ValueError as exc:
+            raise ValueError(f"Error parsing row {line_no} ({row}): {exc}") from exc
 
-        if val < 0:
-            warnings.warn(f"Negative power value ({val} kW) encountered at row {row_idx}, clipping to 0.0.")
-            val = 0.0
+    if not values:
+        raise ValueError(f"No valid data rows found in {path}")
+    return timestamps, np.array(values, dtype=float)
 
-        interval_idx = dt.hour * 4 + (dt.minute // 15)
-        is_weekend = dt.weekday() >= 5  # 5=Saturday, 6=Sunday
 
-        months.append(dt.month)
-        is_weekends.append(is_weekend)
-        interval_indices.append(interval_idx)
-        consumptions.append(val)
+def _infer_resolution_minutes(timestamps: list[datetime]) -> int:
+    """Infer the sampling resolution from the median spacing of consecutive timestamps."""
+    if len(timestamps) < 2:
+        return INTERVAL_MINUTES
+    deltas = [(b - a).total_seconds() / 60 for a, b in zip(timestamps, timestamps[1:])]
+    positive = [d for d in deltas if d > 0]
+    if not positive:
+        raise ValueError("Timestamps must be increasing to infer the profile resolution")
+    resolution = int(round(float(np.median(positive))))
+    if resolution not in SUPPORTED_RESOLUTIONS:
+        raise ValueError(f"Unsupported profile resolution of {resolution} min; supported: {SUPPORTED_RESOLUTIONS}")
+    return resolution
 
-    if len(consumptions) == 0:
-        raise ValueError(f"No valid readings parsed from {path}")
 
-    intervals_arr = np.array(interval_indices, dtype=int)
-    # Check if data is hourly (all intervals are multiples of 4, e.g. 0, 4, 8, ...)
-    if len(intervals_arr) > 10 and np.all(intervals_arr % 4 == 0):
-        # Auto-expand each hourly reading into four 15-minute intervals
-        exp_months = []
-        exp_weekends = []
-        exp_intervals = []
-        exp_consumptions = []
-        for m, w, idx, c in zip(months, is_weekends, intervals_arr, consumptions):
-            for sub_i in range(4):
-                exp_months.append(m)
-                exp_weekends.append(w)
-                exp_intervals.append(idx + sub_i)
-                exp_consumptions.append(c)
-        return (
-            np.array(exp_months, dtype=int),
-            np.array(exp_weekends, dtype=bool),
-            np.array(exp_intervals, dtype=int),
-            np.array(exp_consumptions, dtype=float),
+def _normalize_to_kw(values: np.ndarray, threshold: float = KW_PEAK_THRESHOLD) -> tuple[np.ndarray, str]:
+    """Heuristic unit detection: a peak above ``threshold`` means the values are in W."""
+    peak = float(np.max(values))
+    if peak > threshold:
+        warnings.warn(
+            f"Profile peak {peak:.1f} exceeds {threshold:g}; assuming values are in W and converting to kW.",
+            stacklevel=3,
         )
+        return values / 1000.0, "W"
+    return values, "kW"
 
-    return (
-        np.array(months, dtype=int),
-        np.array(is_weekends, dtype=bool),
-        intervals_arr,
-        np.array(consumptions, dtype=float),
+
+def _resolve_timezone(timezone: str | tzinfo | None) -> tzinfo | None:
+    if timezone is None or isinstance(timezone, tzinfo):
+        return timezone
+    return ZoneInfo(timezone)
+
+
+def load_year_profile_csv(
+    filepath: PathLike,
+    value_column: ValueColumn = None,
+    timezone: str | tzinfo | None = None,
+) -> YearProfile:
+    """Load a ``timestamp, value`` CSV into a 15-minute :class:`YearProfile`.
+
+    Args:
+        filepath: CSV path. Column 0 holds timestamps; an optional header row is detected.
+        value_column: Column name or index of the power values. Defaults to ``consumption_kw`` if
+            present in the header, otherwise column 1.
+        timezone: IANA zone (e.g. ``"Europe/Berlin"``). Timezone-aware timestamps are converted to it
+            before deriving month, weekday and time of day. Naive timestamps are taken as local time.
+            ``None`` uses the wall-clock time exactly as written in the file.
+
+    Values are interpreted as kW unless the peak exceeds :data:`KW_PEAK_THRESHOLD`, in which case
+    they are treated as W and divided by 1000. Negative values are clipped to 0. Hourly and
+    30-minute data are expanded to 15-minute intervals (constant power within the hour).
+    """
+    path = Path(filepath)
+    timestamps, values = _read_timestamp_value_rows(path, value_column)
+    resolution = _infer_resolution_minutes(timestamps)
+
+    tz = _resolve_timezone(timezone)
+    if tz is not None:
+        timestamps = [ts.astimezone(tz) if ts.tzinfo is not None else ts for ts in timestamps]
+
+    negatives = int(np.sum(values < 0))
+    if negatives:
+        warnings.warn(f"{negatives} negative power value(s) clipped to 0.0 in {path}", stacklevel=2)
+        values = np.clip(values, 0.0, None)
+
+    power_kw, unit = _normalize_to_kw(values)
+
+    base_interval = np.array([ts.hour * 4 + ts.minute // INTERVAL_MINUTES for ts in timestamps], dtype=int)
+    expansion = resolution // INTERVAL_MINUTES
+    if np.any(base_interval % expansion):
+        raise ValueError(f"Timestamps of {resolution}-minute data must be aligned to {resolution}-minute boundaries")
+
+    sub_steps = np.tile(np.arange(expansion), len(timestamps))
+    return YearProfile(
+        months=np.repeat([ts.month for ts in timestamps], expansion).astype(int),
+        is_weekend=np.repeat([ts.weekday() >= 5 for ts in timestamps], expansion).astype(bool),
+        interval_idx=np.repeat(base_interval, expansion) + sub_steps,
+        power_kw=np.repeat(power_kw, expansion).astype(float),
+        source_resolution_minutes=resolution,
+        source_unit=unit,
     )
 
 
-def fit_gm_from_year_profile(
-    csv_path: Union[str, Path],
+# --------------------------------------------------------------------------------------
+# Fitting
+# --------------------------------------------------------------------------------------
+
+
+def derive_component(
+    p_peak: float,
     simultaneity: float,
     max_p_on: float = 1.0,
-    mu_ratio: Optional[float] = None,
-    sigma_ratio: Optional[float] = None,
-    component_name: str = "Fitted Household Connection",
-) -> Tuple[GaussianComponent, FactorProfiles, ProfileFitSummary]:
-    """Derive Gaussian Model parameters and factor profiles from an annual load profile matching Rusck's simultaneity model.
+    mu_ratio: float | None = None,
+    sigma_ratio: float | None = None,
+    name: str = "Fitted Household Connection",
+) -> GaussianComponent:
+    """Derive the load component from the diversified profile peak following Rusck.
 
-    In this formulation:
-    - At the profile's peak demand P_peak, activation probability is max_p_on (defaults to 1.0 = 100%):
-        p(on)_peak = max_p_on
-    - For all time steps t:
-        p(on, t) = max_p_on * (P(t) / P_peak)
-    - Connection capacity matches Rusck's definition (P_peak = s * P_max):
-        P_max = P_peak / s
-    - Active load parameters match the desired simultaneity:
-        mu_ratio = s / max_p_on  (so mu * max_p_on = P_peak)
-        sigma_ratio = (1.0 - mu_ratio) / 2.32635  (matches Rusck's 99th percentile curve: mu + 2.33*sigma = P_max)
-    - Fleet average load as N -> infinity is:
-        E[P_peak] = p(on)_peak * mu = max_p_on * (P_peak / max_p_on) = P_peak
-    - Single connection peak at N = 1 (99th percentile) is:
-        P_1 = mu + 2.326 * sigma = s * P_max + (1 - s) * P_max = P_max
+    - ``P_max = P_peak / s``
+    - ``mu_ratio = s / max_p_on`` (so that ``mu * max_p_on = P_peak``)
+    - ``sigma_ratio = (1 - mu_ratio) / z_0.99`` (so that ``mu + z_0.99 * sigma = P_max``)
 
-    Args:
-        csv_path: Path to two-column CSV (timestamp, consumption_kw).
-        simultaneity: Target simultaneity factor s in (0, 1].
-        max_p_on: Maximum activation probability p(on) at peak demand (default: 1.0).
-        mu_ratio: Median active power as ratio of P_max (defaults to s / max_p_on).
-        sigma_ratio: Standard deviation as ratio of P_max (defaults to (1 - mu_ratio) / 2.32635).
-        component_name: Identifier for the created GaussianComponent.
-
-    Returns:
-        Tuple of (GaussianComponent, FactorProfiles, ProfileFitSummary).
+    Note that the design relations use the location ``mu``; the truncated mean
+    (:attr:`GaussianComponent.mean`) deviates slightly when the truncation is asymmetric.
     """
     if not (0.0 < simultaneity <= 1.0):
         raise ValueError(f"Simultaneity must be in (0, 1], got {simultaneity}")
     if not (0.0 < max_p_on <= 1.0):
         raise ValueError(f"max_p_on must be in (0, 1], got {max_p_on}")
-
-    months, is_weekends, interval_indices, consumptions = load_year_profile_csv(csv_path)
-
-    p_peak = float(np.max(consumptions))
     if p_peak <= 0:
         raise ValueError("Maximum power consumption in year profile must be strictly positive")
 
-    # 1. Connection capacity from Rusck: P_max = P_peak / simultaneity
-    p_max = float(p_peak / simultaneity)
-
-    # 2. Derive mu_ratio and sigma_ratio matching simultaneity and max_p_on
-    if mu_ratio is None:
-        eff_mu_ratio = round(float(simultaneity / max_p_on), 5)  # mu * max_p_on = p_peak
-    else:
-        eff_mu_ratio = float(mu_ratio)
-
-    if sigma_ratio is None:
-        # Match Rusck's 99th percentile spread (z_0.99 = 2.32635): mu + z * sigma = P_max
-        margin = max(0.0, 1.0 - eff_mu_ratio)
-        eff_sigma_ratio = round(float(margin / 2.32635), 4)
-    else:
-        eff_sigma_ratio = float(sigma_ratio)
-
+    eff_mu_ratio = simultaneity / max_p_on if mu_ratio is None else float(mu_ratio)
     if not (0.0 < eff_mu_ratio <= 1.0):
         raise ValueError(f"mu_ratio must be in (0, 1], got {eff_mu_ratio}. Check that simultaneity <= max_p_on.")
-    if eff_sigma_ratio < 0.0:
-        raise ValueError(f"sigma_ratio must be non-negative, got {eff_sigma_ratio}")
 
-    # 3. Peak activation probability is fixed to max_p_on at peak demand
-    peak_p_on = float(max_p_on)
+    eff_sigma_ratio = max(0.0, 1.0 - eff_mu_ratio) / Z_99 if sigma_ratio is None else float(sigma_ratio)
 
-    # Continuous activation probability series: p(on, t) = max_p_on * (P(t) / P_peak)
-    p_on_series = np.clip(peak_p_on * (consumptions / p_peak), 0.0, 1.0)
-    mean_p_on_overall = float(np.mean(p_on_series))
-    if mean_p_on_overall == 0:
-        mean_p_on_overall = 1e-6
-
-    # 1. Month factors: mean p(on) in month m relative to annual mean
-    month_factors = np.ones(12, dtype=float)
-    for m in range(1, 13):
-        mask_m = months == m
-        if np.any(mask_m):
-            month_factors[m - 1] = float(np.mean(p_on_series[mask_m])) / mean_p_on_overall
-        else:
-            month_factors[m - 1] = 1.0
-
-    # 2. Interval factors for weekday and weekend
-    weekday_factors_raw = np.zeros(96, dtype=float)
-    weekend_factors_raw = np.zeros(96, dtype=float)
-
-    mask_weekday = ~is_weekends
-    mask_weekend = is_weekends
-
-    for idx in range(96):
-        # Weekday
-        mask_w_idx = mask_weekday & (interval_indices == idx)
-        if np.any(mask_w_idx):
-            weekday_factors_raw[idx] = float(np.mean(p_on_series[mask_w_idx])) / mean_p_on_overall
-        else:
-            weekday_factors_raw[idx] = 1.0
-
-        # Weekend
-        mask_h_idx = mask_weekend & (interval_indices == idx)
-        if np.any(mask_h_idx):
-            weekend_factors_raw[idx] = float(np.mean(p_on_series[mask_h_idx])) / mean_p_on_overall
-        else:
-            weekend_factors_raw[idx] = 1.0
-
-    # 3. Scale factor matrices so max(f_month * f_interval) == peak_p_on
-    p_weekday_outer = np.outer(month_factors, weekday_factors_raw)
-    p_weekend_outer = np.outer(month_factors, weekend_factors_raw)
-    raw_max_prod = max(float(np.max(p_weekday_outer)), float(np.max(p_weekend_outer)))
-
-    if raw_max_prod > 0:
-        scale = peak_p_on / raw_max_prod
-    else:
-        scale = 1.0
-
-    weekday_factors = np.round(weekday_factors_raw * scale, 5)
-    weekend_factors = np.round(weekend_factors_raw * scale, 5)
-    month_factors = np.round(month_factors, 5)
-
-    # 4. Construct objects
-    component = GaussianComponent(
-        p_max=p_max,
+    return GaussianComponent(
+        p_max=p_peak / simultaneity,
         mu_ratio=eff_mu_ratio,
         sigma_ratio=eff_sigma_ratio,
-        name=component_name,
+        name=name,
     )
 
-    factor_profiles = FactorProfiles(
-        month_factors=month_factors,
-        weekday_factors=weekday_factors,
-        weekend_factors=weekend_factors,
+
+def _relative_group_means(values: np.ndarray, groups: np.ndarray, n_groups: int, reference: float) -> np.ndarray:
+    """Mean of ``values`` per group divided by ``reference``; empty groups get a neutral factor of 1."""
+    sums = np.bincount(groups, weights=values, minlength=n_groups)
+    counts = np.bincount(groups, minlength=n_groups)
+    factors = np.ones(n_groups, dtype=float)
+    present = counts > 0
+    factors[present] = sums[present] / counts[present] / reference
+    return factors
+
+
+def decompose_factors(profile: YearProfile, peak_p_on: float) -> FactorProfiles:
+    """Decompose a profile into month and weekday/weekend interval factors.
+
+    ``p(on, t) = peak_p_on * P(t) / P_peak`` is averaged per month and per interval (relative to
+    the annual mean). Interval factors are then scaled so ``max(month_factor * interval_factor)``
+    equals ``peak_p_on``.
+    """
+    p_on_series = np.clip(peak_p_on * profile.power_kw / profile.peak_kw, 0.0, 1.0)
+    mean_p_on = float(np.mean(p_on_series))
+
+    month_factors = _relative_group_means(p_on_series, profile.months - 1, MONTHS_PER_YEAR, mean_p_on)
+    weekday = ~profile.is_weekend
+    weekday_raw = _relative_group_means(
+        p_on_series[weekday], profile.interval_idx[weekday], INTERVALS_PER_DAY, mean_p_on
+    )
+    weekend_raw = _relative_group_means(
+        p_on_series[~weekday], profile.interval_idx[~weekday], INTERVALS_PER_DAY, mean_p_on
     )
 
-    # Annual energy assuming 15-minute readings: power * 0.25 h
-    annual_kwh = float(np.sum(consumptions) * 0.25)
+    raw = FactorProfiles(month_factors, weekday_raw, weekend_raw)
+    raw_max = float(np.max(raw.raw_products()))
+    scale = peak_p_on / raw_max if raw_max > 0 else 1.0
+
+    return FactorProfiles(month_factors, weekday_raw * scale, weekend_raw * scale)
+
+
+def fit_from_profile(
+    profile: YearProfile,
+    simultaneity: float,
+    max_p_on: float = 1.0,
+    mu_ratio: float | None = None,
+    sigma_ratio: float | None = None,
+    component_name: str = "Fitted Household Connection",
+) -> tuple[GaussianComponent, FactorProfiles, ProfileFitSummary]:
+    """Fit component and factor profiles from an already loaded :class:`YearProfile`."""
+    p_peak = profile.peak_kw
+    component = derive_component(p_peak, simultaneity, max_p_on, mu_ratio, sigma_ratio, component_name)
+    factors = decompose_factors(profile, peak_p_on=max_p_on)
 
     summary = ProfileFitSummary(
         p_peak=p_peak,
         simultaneity=simultaneity,
-        p_max=p_max,
-        mu_ratio=eff_mu_ratio,
-        sigma_ratio=eff_sigma_ratio,
-        peak_p_on=peak_p_on,
-        annual_energy_kwh=annual_kwh,
-        total_records=len(consumptions),
+        p_max=component.p_max,
+        mu_ratio=component.mu_ratio,
+        sigma_ratio=component.sigma_ratio,
+        peak_p_on=float(max_p_on),
+        annual_energy_kwh=profile.energy_kwh,
+        total_records=len(profile),
+        source_unit=profile.source_unit,
+        source_resolution_minutes=profile.source_resolution_minutes,
     )
+    return component, factors, summary
 
-    return component, factor_profiles, summary
+
+def fit_gm_from_year_profile(
+    csv_path: PathLike,
+    simultaneity: float,
+    max_p_on: float = 1.0,
+    mu_ratio: float | None = None,
+    sigma_ratio: float | None = None,
+    component_name: str = "Fitted Household Connection",
+    value_column: ValueColumn = None,
+    timezone: str | tzinfo | None = None,
+) -> tuple[GaussianComponent, FactorProfiles, ProfileFitSummary]:
+    """Load a year profile CSV and fit component and factors matching Rusck's simultaneity model.
+
+    - At the profile peak, the activation probability is ``max_p_on``; elsewhere
+      ``p(on, t) = max_p_on * P(t) / P_peak``.
+    - The component follows :func:`derive_component`, so the fleet expectation
+      ``mu * max_p_on`` equals ``P_peak`` and the single-connection 99th percentile reaches ``P_max``.
+
+    See :func:`load_year_profile_csv` for ``value_column`` and ``timezone``.
+    """
+    # Validate cheap arguments before parsing a potentially large file
+    derive_component(1.0, simultaneity, max_p_on, mu_ratio, sigma_ratio, component_name)
+    profile = load_year_profile_csv(csv_path, value_column=value_column, timezone=timezone)
+    return fit_from_profile(profile, simultaneity, max_p_on, mu_ratio, sigma_ratio, component_name)
+
+
+# --------------------------------------------------------------------------------------
+# Conversion
+# --------------------------------------------------------------------------------------
 
 
 def convert_w_profile_to_kw_csv(
-    input_path: Union[str, Path],
-    output_path: Union[str, Path],
-    value_column: Optional[str] = "admd_scaled_w_per_hp",
+    input_path: PathLike,
+    output_path: PathLike,
+    value_column: ValueColumn = "admd_scaled_w_per_hp",
     expand_to_15min: bool = True,
 ) -> Path:
-    """Convert a profile CSV with power in Watts to a standardized 2-column CSV (timestamp, consumption_kw).
+    """Convert a profile CSV with power in W to a standardized ``timestamp, consumption_kw`` CSV.
 
     Args:
-        input_path: Path to source CSV.
-        output_path: Target path for the converted CSV.
-        value_column: Column name in source CSV (e.g. 'admd_scaled_w_per_hp' or 'archetype_w').
-                      Defaults to 'admd_scaled_w_per_hp'.
-        expand_to_15min: If True, expands hourly data to 15-minute intervals.
+        input_path: Source CSV (timestamps in column 0).
+        output_path: Target CSV path.
+        value_column: Column name or index holding the power in W. A missing column raises.
+        expand_to_15min: Repeat each reading of coarser (30/60-minute) data as 15-minute rows.
 
-    Returns:
-        Path to the saved CSV.
+    Timezone offsets in the source timestamps are preserved in the output.
     """
-    in_p = Path(input_path)
     out_p = Path(output_path)
+    timestamps, watts = _read_timestamp_value_rows(Path(input_path), value_column)
+    expansion = _infer_resolution_minutes(timestamps) // INTERVAL_MINUTES if expand_to_15min else 1
+
     out_p.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(in_p, "r", encoding="utf-8-sig") as f:
-        reader = csv.reader(f)
-        header = next(reader, None)
-        if not header:
-            raise ValueError(f"Input file is empty: {in_p}")
-
-        col_idx = 1
-        if value_column and value_column in header:
-            col_idx = header.index(value_column)
-        elif len(header) >= 3:
-            # Default to column 2 (admd_scaled_w_per_hp) if present
-            col_idx = 2
-
-        out_rows = [["timestamp", "consumption_kw"]]
-        for row in reader:
-            if len(row) <= col_idx:
-                continue
-            ts_str = row[0].strip()
-            w_val = float(row[col_idx].strip())
-            kw_val = round(w_val / 1000.0, 6)
-
-            dt = _parse_timestamp(ts_str)
-
-            if expand_to_15min:
-                for sub_i in range(4):
-                    sub_dt = dt + timedelta(minutes=15 * sub_i)
-                    out_rows.append([sub_dt.strftime("%Y-%m-%d %H:%M:%S"), f"{kw_val:.6f}"])
-            else:
-                out_rows.append([dt.strftime("%Y-%m-%d %H:%M:%S"), f"{kw_val:.6f}"])
-
     with open(out_p, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerows(out_rows)
+        writer.writerow(["timestamp", DEFAULT_VALUE_COLUMN_NAME])
+        for ts, w_val in zip(timestamps, watts):
+            kw = f"{w_val / 1000.0:.6f}"
+            for step in range(expansion):
+                sub_ts = ts + timedelta(minutes=INTERVAL_MINUTES * step)
+                writer.writerow([sub_ts.isoformat(sep=" "), kw])
 
     return out_p

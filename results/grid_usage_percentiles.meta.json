@@ -1,0 +1,40 @@
+{
+  "component": {
+    "name": "Household Connected Load",
+    "p_max_kw": 11.0,
+    "mu_ratio": 0.35,
+    "sigma_ratio": 0.15,
+    "mu_kw": 3.8499999999999996,
+    "sigma_kw": 1.65,
+    "mean_active_kw": 3.8936397136775867
+  },
+  "critical_point": {
+    "month": 12,
+    "month_name": "December",
+    "day_type": "weekday",
+    "interval_idx": 77,
+    "time": "19:15",
+    "p_on": 0.6144,
+    "month_factor": 1.28,
+    "interval_factor": 0.48
+  },
+  "expected_load_per_conn_kw": 2.392252240083509,
+  "num_runs": 200,
+  "percentiles": [
+    50.0,
+    95.0,
+    99.0
+  ],
+  "connections": [
+    1,
+    2,
+    5,
+    10,
+    15,
+    20,
+    30,
+    50,
+    100,
+    200
+  ]
+}

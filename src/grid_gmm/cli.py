@@ -1,210 +1,212 @@
-"""Command-line interface for running grid usage Gaussian simulation."""
+"""Command-line interface for the grid usage Gaussian simulation."""
+
+from __future__ import annotations
 
 import argparse
-import csv
+import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Optional, Sequence
 
-from grid_gmm.example_data import (
-    create_example_component,
-    create_example_profiles,
-    export_example_config,
-    load_config_from_json,
-)
+from grid_gmm.config import load_config_from_json, save_config_to_json
+from grid_gmm.example_data import create_example_component, create_example_profiles, export_example_config
+from grid_gmm.factors import FactorProfiles
 from grid_gmm.model import GaussianComponent
 from grid_gmm.plotting import plot_percentiles_per_connection
+from grid_gmm.profile_fitter import convert_w_profile_to_kw_csv, fit_gm_from_year_profile
+from grid_gmm.reporting import format_summary_table, save_results_to_csv
 from grid_gmm.simulation import (
     DEFAULT_CONNECTIONS,
     DEFAULT_NUM_RUNS,
     DEFAULT_PERCENTILES,
+    DEFAULT_SEED,
     MonteCarloEngine,
-    SimulationResults,
 )
 
+DEFAULT_SIMULTANEITY = 0.3
+DEFAULT_MAX_P_ON = 1.0
+DEFAULT_CSV = "results/grid_usage_percentiles.csv"
+DEFAULT_PLOT = "results/grid_usage_percentiles.png"
 
-def save_results_to_csv(results: SimulationResults, filepath: Path) -> None:
-    """Save simulation results to a CSV file with metadata header."""
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    cp = results.critical_point
-
-    with open(filepath, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        # Metadata comments
-        writer.writerow(["# Simulation Metadata"])
-        writer.writerow(["# Critical Month", cp.month_name, f"(Month {cp.month})"])
-        writer.writerow(["# Critical Day Type", cp.day_type])
-        writer.writerow(["# Critical Interval", cp.time_str, f"(Index {cp.interval_idx})"])
-        writer.writerow(["# Peak p(on)", f"{cp.p_on:.4f}"])
-        writer.writerow(["# P_max (kW)", results.component.p_max])
-        writer.writerow(["# mu (kW)", f"{results.component.mu:.4f}", f"({results.component.mu_ratio:.2%} of P_max)"])
-        expected_inf = results.component.mu * cp.p_on
-        writer.writerow(["# Expected Load (N->inf)", f"{expected_inf:.4f} kW", f"(mu * p(on) = {results.component.mu:.2f} * {cp.p_on:.4f})"])
-        writer.writerow(["# Number of Runs per Connection Count", results.num_runs])
-        writer.writerow([])
-
-        # Table header
-        header = ["connections", "p_max_kw"]
-        for pct in results.percentiles:
-            header.append(f"p_total_p{pct:g}_kw")
-        for pct in results.percentiles:
-            header.append(f"p_per_conn_p{pct:g}_kw")
-        header.append("runs")
-        writer.writerow(header)
-
-        # Data rows
-        for i, n in enumerate(results.connections):
-            row = [n, results.component.p_max]
-            for pct in results.percentiles:
-                row.append(f"{results.p_total[pct][i]:.3f}")
-            for pct in results.percentiles:
-                row.append(f"{results.p_per_conn[pct][i]:.3f}")
-            row.append(results.num_runs)
-            writer.writerow(row)
+#: Options that only make sense together with --from-year-profile (dest names).
+_FIT_ONLY_OPTIONS = ("simultaneity", "max_p_on", "timezone")
 
 
-def print_summary_table(results: SimulationResults) -> None:
-    """Print an ASCII table of results to standard output."""
-    cp = results.critical_point
-    comp = results.component
-    print("=" * 82)
-    print("                 GRID USAGE GAUSSIAN LOAD SIMULATION REPORT               ")
-    print("=" * 82)
-    print(f"Component:          {comp.name}")
-    print(f"Parameters:         P_max = {comp.p_max:.1f} kW | mu = {comp.mu:.2f} kW ({comp.mu_ratio:.1%}) | sigma = {comp.sigma:.2f} kW ({comp.sigma_ratio:.1%})")
-    print("-" * 82)
-    print("CRITICAL POINT IN TIME (Calculated ahead of Monte Carlo):")
-    print(f"  Month:            {cp.month_name} (factor: {cp.month_factor:.2f})")
-    print(f"  Day Type:         {cp.day_type.capitalize()}")
-    print(f"  Interval / Time:  {cp.time_str} (factor: {cp.interval_factor:.2f})")
-    expected_inf = comp.mu * cp.p_on
-    print(f"  Peak p(on):       {cp.p_on:.2%} ({cp.p_on:.4f})")
-    print(f"  Expected (N->inf):{expected_inf:.2f} kW / household (mu * p(on))")
-    print(f"  Monte Carlo Runs: {results.num_runs} per connection count")
-    print("=" * 82)
-    print(f"{'Conns':>7} | {'P_tot p50':>10} | {'P_tot p95':>10} | {'P_tot p99':>10} | {'kW/conn p50':>11} | {'kW/conn p95':>11} | {'kW/conn p99':>11}")
-    print("-" * 82)
-
-    p50, p95, p99 = results.percentiles[0], results.percentiles[1], results.percentiles[2]
-    for i, n in enumerate(results.connections):
-        tot_50 = results.p_total[p50][i]
-        tot_95 = results.p_total[p95][i]
-        tot_99 = results.p_total[p99][i]
-        pc_50 = results.p_per_conn[p50][i]
-        pc_95 = results.p_per_conn[p95][i]
-        pc_99 = results.p_per_conn[p99][i]
-        print(f"{n:>7d} | {tot_50:>10.2f} | {tot_95:>10.2f} | {tot_99:>10.2f} | {pc_50:>11.2f} | {pc_95:>11.2f} | {pc_99:>11.2f}")
-    print("=" * 82)
-
-
-def main(args_list: Optional[Sequence[str]] = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Simulate household grid usage with truncated Gaussian distribution at critical peak time."
+        prog="grid-gmm",
+        description="Simulate household grid usage with a truncated Gaussian load model at the critical peak time.",
     )
-    parser.add_argument("--config", type=str, default=None, help="Path to custom JSON configuration file")
-    parser.add_argument(
+
+    source = parser.add_argument_group("input source / standalone actions (mutually exclusive)")
+    exclusive = source.add_mutually_exclusive_group()
+    exclusive.add_argument("--config", type=Path, help="Load component and factors from a JSON configuration")
+    exclusive.add_argument(
         "--from-year-profile",
-        type=str,
-        default=None,
-        help="Path to 2-column CSV (timestamp, consumption_kw) to generate GM parameters and factor profiles",
+        type=Path,
+        metavar="CSV",
+        help="Fit component and factors from a 'timestamp, power' CSV (kW, or W if the peak exceeds 20)",
     )
-    parser.add_argument(
+    exclusive.add_argument("--save-example-config", type=Path, metavar="JSON", help="Write the example config and exit")
+    exclusive.add_argument(
+        "--convert-w-profile",
+        type=Path,
+        nargs=2,
+        metavar=("INPUT", "OUTPUT"),
+        help="Convert a W profile CSV to a 15-minute 'timestamp, consumption_kw' CSV and exit",
+    )
+
+    fit = parser.add_argument_group("year-profile fitting (with --from-year-profile)")
+    fit.add_argument(
         "--simultaneity",
         type=float,
-        default=0.3,
-        help="Target simultaneity factor s in (0, 1] when fitting from year profile (default: 0.3)",
+        help=f"Target simultaneity factor s in (0, 1] (default: {DEFAULT_SIMULTANEITY})",
     )
-    parser.add_argument(
+    fit.add_argument(
         "--max-p-on",
         type=float,
-        default=1.0,
-        help="Maximum activation probability p(on) at peak demand (default: 1.0)",
+        help=f"Activation probability p(on) at peak demand (default: {DEFAULT_MAX_P_ON})",
     )
-    parser.add_argument("--save-example-config", type=str, default=None, help="Save default example config to JSON")
-    parser.add_argument("--p-max", type=float, default=None, help="Override P_max in kW (default: 11.0)")
-    parser.add_argument("--mu-ratio", type=float, default=None, help="Override mu ratio of P_max")
-    parser.add_argument("--sigma-ratio", type=float, default=None, help="Override sigma ratio of P_max")
-    parser.add_argument("--runs", type=int, default=DEFAULT_NUM_RUNS, help="Number of Monte Carlo simulations (default: 200)")
-    parser.add_argument(
+    fit.add_argument(
+        "--timezone",
+        help="IANA timezone (e.g. Europe/Berlin) to convert timezone-aware timestamps to before fitting",
+    )
+    fit.add_argument(
+        "--value-column",
+        help="Name or index of the power column (also used by --convert-w-profile)",
+    )
+
+    model = parser.add_argument_group("model overrides")
+    model.add_argument("--p-max", type=float, help="Override P_max in kW (not allowed with --from-year-profile)")
+    model.add_argument("--mu-ratio", type=float, help="Override mu as ratio of P_max")
+    model.add_argument("--sigma-ratio", type=float, help="Override sigma as ratio of P_max")
+    model.add_argument("--name", help="Override the component name")
+
+    sim = parser.add_argument_group("simulation")
+    sim.add_argument(
+        "--runs", type=int, default=DEFAULT_NUM_RUNS, help=f"Monte Carlo runs (default: {DEFAULT_NUM_RUNS})"
+    )
+    sim.add_argument(
         "--connections",
         type=int,
         nargs="+",
         default=list(DEFAULT_CONNECTIONS),
-        help="List of connection counts to evaluate (default: 1 2 5 10 15 20 30 50 100 200)",
+        help="Connection counts to evaluate (default: %(default)s)",
     )
-    parser.add_argument("--csv", type=str, default="results/grid_usage_percentiles.csv", help="Path to save output CSV")
-    parser.add_argument("--plot", type=str, default="results/grid_usage_percentiles.png", help="Path to save output plot PNG")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42)")
+    sim.add_argument(
+        "--percentiles",
+        type=float,
+        nargs="+",
+        default=list(DEFAULT_PERCENTILES),
+        help="Percentiles to report (default: %(default)s)",
+    )
+    sim.add_argument("--seed", type=int, default=DEFAULT_SEED, help=f"Random seed (default: {DEFAULT_SEED})")
 
-    args = parser.parse_args(args_list)
+    out = parser.add_argument_group("output")
+    out.add_argument("--csv", type=Path, default=Path(DEFAULT_CSV), help="Results CSV (default: %(default)s)")
+    out.add_argument("--plot", type=Path, default=Path(DEFAULT_PLOT), help="Results plot (default: %(default)s)")
+    out.add_argument("--save-config", type=Path, metavar="JSON", help="Also save the used component and factors")
+    return parser
 
-    if args.save_example_config:
+
+def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.from_year_profile is None:
+        given = [f"--{opt.replace('_', '-')}" for opt in _FIT_ONLY_OPTIONS if getattr(args, opt) is not None]
+        if given:
+            parser.error(f"{', '.join(given)} can only be used with --from-year-profile")
+    elif args.p_max is not None:
+        parser.error("--p-max cannot be combined with --from-year-profile: P_max is derived as P_peak / simultaneity")
+
+
+def _fit_from_year_profile(args: argparse.Namespace) -> tuple[GaussianComponent, FactorProfiles]:
+    simultaneity = DEFAULT_SIMULTANEITY if args.simultaneity is None else args.simultaneity
+    max_p_on = DEFAULT_MAX_P_ON if args.max_p_on is None else args.max_p_on
+
+    print(f"Fitting GM parameters from annual profile: {args.from_year_profile}")
+    print(f"Target Simultaneity (Rusck g_inf): {simultaneity:.2f} | Max p(on): {max_p_on:.1%}")
+
+    fit_kwargs = {"component_name": args.name} if args.name else {}
+    component, factors, summary = fit_gm_from_year_profile(
+        csv_path=args.from_year_profile,
+        simultaneity=simultaneity,
+        max_p_on=max_p_on,
+        mu_ratio=args.mu_ratio,
+        sigma_ratio=args.sigma_ratio,
+        value_column=args.value_column,
+        timezone=args.timezone,
+        **fit_kwargs,
+    )
+
+    print(f"  Source:                     {summary.source_unit}, {summary.source_resolution_minutes}-minute data")
+    print(f"  Profile Diversified P_peak: {summary.p_peak:.2f} kW")
+    print(f"  Derived Rusck P_max:        {summary.p_max:.2f} kW (P_peak / simultaneity)")
+    print(f"  Active Load mu:             {component.mu:.2f} kW ({component.mu_ratio:.1%} of P_max)")
+    print(f"  Active Load sigma:          {component.sigma:.2f} kW ({component.sigma_ratio:.1%} of P_max)")
+    print(f"  Peak Activation p(on):      {summary.peak_p_on:.1%}")
+    print(f"  Annual Energy:              {summary.annual_energy_kwh:.1f} kWh ({summary.total_records} intervals)")
+    print()
+    return component, factors
+
+
+def _load_model(args: argparse.Namespace) -> tuple[GaussianComponent, FactorProfiles]:
+    if args.from_year_profile is not None:
+        return _fit_from_year_profile(args)
+
+    if args.config is not None:
+        component, factors = load_config_from_json(args.config)
+    else:
+        component, factors = create_example_component(), create_example_profiles()
+
+    overridden = component.with_overrides(
+        p_max=args.p_max, mu_ratio=args.mu_ratio, sigma_ratio=args.sigma_ratio, name=args.name
+    )
+    return overridden, factors
+
+
+def _run(args: argparse.Namespace) -> int:
+    if args.save_example_config is not None:
         export_example_config(args.save_example_config)
         print(f"Saved example configuration to {args.save_example_config}")
         return 0
 
-    # Load, fit, or create component and factors
-    if args.from_year_profile:
-        from grid_gmm.profile_fitter import fit_gm_from_year_profile
+    if args.convert_w_profile is not None:
+        src, dst = args.convert_w_profile
+        convert_kwargs = {"value_column": args.value_column} if args.value_column is not None else {}
+        convert_w_profile_to_kw_csv(src, dst, **convert_kwargs)
+        print(f"Converted {src} -> {dst}")
+        return 0
 
-        print(f"Fitting GM parameters from annual profile: {args.from_year_profile}")
-        print(f"Target Simultaneity (Rusck g_inf): {args.simultaneity:.2f} | Max p(on): {args.max_p_on:.1%}")
+    component, factors = _load_model(args)
+    if args.save_config is not None:
+        save_config_to_json(component, factors, args.save_config)
+        print(f"Configuration saved to:            {args.save_config.resolve()}")
 
-        component, factors, summary = fit_gm_from_year_profile(
-            csv_path=args.from_year_profile,
-            simultaneity=args.simultaneity,
-            max_p_on=args.max_p_on,
-            mu_ratio=args.mu_ratio,
-            sigma_ratio=args.sigma_ratio,
-        )
-
-        print(f"  Profile Diversified P_peak: {summary.p_peak:.2f} kW")
-        print(f"  Derived Rusck P_max:        {summary.p_max:.2f} kW (P_peak / simultaneity)")
-        print(f"  Active Load mu:             {component.mu:.2f} kW ({component.mu_ratio:.1%} of P_max)")
-        print(f"  Active Load sigma:          {component.sigma:.2f} kW ({component.sigma_ratio:.1%} of P_max)")
-        print(f"  Peak Activation p(on):      {summary.peak_p_on:.1%}")
-        print(f"  Annual Energy:              {summary.annual_energy_kwh:.1f} kWh ({summary.total_records} intervals)")
-        print()
-
-    elif args.config:
-        component, factors = load_config_from_json(args.config)
-    else:
-        component = create_example_component()
-        factors = create_example_profiles()
-
-    # Apply command-line overrides
-    if args.p_max is not None:
-        component.p_max = args.p_max
-    if args.mu_ratio is not None:
-        component.mu_ratio = args.mu_ratio
-    if args.sigma_ratio is not None:
-        component.sigma_ratio = args.sigma_ratio
-
-    # Initialize engine
     engine = MonteCarloEngine(component=component, factors=factors, seed=args.seed)
-
-    # Run simulation
     results = engine.run_critical_time_simulation(
         connection_counts=args.connections,
         num_runs=args.runs,
-        percentiles=DEFAULT_PERCENTILES,
+        percentiles=args.percentiles,
     )
 
-    # Print summary table
-    print_summary_table(results)
+    print(format_summary_table(results))
 
-    # Save CSV
-    csv_path = Path(args.csv)
-    save_results_to_csv(results, csv_path)
-    print(f"Results successfully saved to CSV: {csv_path.resolve()}")
+    meta_path = save_results_to_csv(results, args.csv)
+    print(f"Results successfully saved to CSV: {args.csv.resolve()} (metadata: {meta_path.name})")
 
-    # Generate and save plot
-    plot_path = Path(args.plot)
-    plot_percentiles_per_connection(results, output_path=plot_path)
-    print(f"Plot successfully saved to:        {plot_path.resolve()}")
-
+    plot_percentiles_per_connection(results, output_path=args.plot)
+    print(f"Plot successfully saved to:        {args.plot.resolve()}")
     return 0
 
 
+def main(args_list: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(args_list)
+    _validate_args(parser, args)
+    try:
+        return _run(args)
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    import sys
     sys.exit(main())

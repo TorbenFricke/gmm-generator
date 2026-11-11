@@ -22,3 +22,10 @@ htmlcov/
 .vscode/
 *.swp
 *~
+
+# Packaging & tooling caches
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
