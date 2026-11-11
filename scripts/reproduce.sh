@@ -62,5 +62,10 @@ hp_fit --max-p-on 0.7 --mu-ratio 1.0 --sigma-ratio 0 --runs 1000 \
     --csv results/hp_terrace_simultaneity_0.7_binary.csv \
     --plot results/hp_terrace_simultaneity_0.7_binary.png
 
+# --- 4. Electric cooking: P_max = 3 kW, p(on) = 10 %, mu/sigma calibrated against Rusck -------
+echo
+echo ">>> scripts/generate_cooking_gm.py"
+"$PYTHON" scripts/generate_cooking_gm.py
+
 echo
 echo "All artifacts regenerated."

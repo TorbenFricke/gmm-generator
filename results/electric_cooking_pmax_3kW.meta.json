@@ -1,0 +1,40 @@
+{
+  "component": {
+    "name": "Electric Cooking (P_max=3 kW, p_on=10%)",
+    "p_max_kw": 3.0,
+    "mu_ratio": 0.4735142272261656,
+    "sigma_ratio": 0.9999933576978458,
+    "mu_kw": 1.4205426816784967,
+    "sigma_kw": 2.9999800730935373,
+    "mean_active_kw": 1.4935965899999954
+  },
+  "critical_point": {
+    "month": 2,
+    "month_name": "February",
+    "day_type": "weekday",
+    "interval_idx": 64,
+    "time": "16:00",
+    "p_on": 0.10000000000000002,
+    "month_factor": 0.9999999999999974,
+    "interval_factor": 0.10000000000000027
+  },
+  "expected_load_per_conn_kw": 0.14935965899999956,
+  "num_runs": 1000,
+  "percentiles": [
+    50.0,
+    95.0,
+    99.0
+  ],
+  "connections": [
+    1,
+    2,
+    5,
+    10,
+    15,
+    20,
+    30,
+    50,
+    100,
+    200
+  ]
+}

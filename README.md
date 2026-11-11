@@ -265,7 +265,10 @@ scripts/reproduce.sh
 ```
 
 The script regenerates the converted input profiles in `input_profiles/` and every artifact in
-`results/` that comes from them. `results/fitted_year_percentiles.*` comes from a profile that is
+`results/` that comes from them. This includes the electric cooking GM from
+`scripts/generate_cooking_gm.py`: a fixed daily hourly profile repeated over a year with
+$P_{\max} = 3$ kW (so $g_\infty = P_{\text{peak}} / P_{\max} \approx 0.05$) and $p = 0.1$. Its $\mu$ fixes
+the mean, and its $\sigma$ is calibrated against Rusck's curve. See [docs/electric_cooking_gm.md](docs/electric_cooking_gm.md) for how these values were derived. `results/fitted_year_percentiles.*` comes from a profile that is
 not in the repository, so the script cannot recreate it.
 
 ## Development
