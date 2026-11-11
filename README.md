@@ -27,8 +27,8 @@ $\mu$, $\sigma$ and $p$ shape it, and why the match only holds at the peak.
 
 ### Notation
 
-All powers are expressed **in units of $P_{\max}$**, so $\mu$ and $\sigma$ are the
-`mu_ratio` and `sigma_ratio` of the code.
+All powers are expressed **in units of $P_{\max} = P_{\max}(1)$**, the maximum load of a single
+connection, so $\mu$ and $\sigma$ are the `mu_ratio` and `sigma_ratio` of the code.
 
 | Symbol | Meaning |
 | --- | --- |
@@ -36,8 +36,8 @@ All powers are expressed **in units of $P_{\max}$**, so $\mu$ and $\sigma$ are t
 | $\mu,\ \sigma$ | location and scale of the active load (Gaussian truncated to $[0, 1]$) |
 | $p(t)$ | activation probability $p(\text{on})$ at time step $t$; $p$ without argument is its value at the peak (`--max-p-on`) |
 | $z$ | standard-normal quantile; $z_{0.99} \approx 2.326$ is the 99th percentile used throughout |
-| $g(N)$ | simultaneity at the peak: the 99th-percentile load of $N$ connections per connection; $g(N, t)$ at time step $t$ |
-| $s$ | asymptotic simultaneity $g(\infty)$ at the peak (`--simultaneity`) |
+| $g(N)$ | simultaneity (Rusck): the maximum load of $N$ connections relative to the sum of their individual maxima, $g(N) = P_{\max}(N) / (N \cdot P_{\max}(1))$; evaluated at the peak, $g(N, t)$ at time step $t$ |
+| $g_\infty$ | asymptotic simultaneity $\lim_{N \to \infty} g(N)$ at the peak (`--simultaneity`); $g_\infty(t)$ at time step $t$ |
 
 The formulas below neglect truncation (they use $E[\text{load}] \approx \mu$ and
 $\mathrm{Var} \approx \sigma^2$) and use the normal approximation for sums. The Monte Carlo
@@ -46,10 +46,10 @@ tables (40,000 runs per value) show the exact values.
 ### 1. Rusck's curve
 
 $$
-g(N) = s + \frac{1 - s}{\sqrt{N}}
+g(N) = g_\infty + \frac{1 - g_\infty}{\sqrt{N}}
 $$
 
-A single connection reaches $P_{\max}$ ($g(1) = 1$). Large groups approach $s$.
+A single connection reaches $P_{\max}$ ($g(1) = 1$). Large groups approach $g_\infty$.
 
 ### 2. Simultaneity in the Gaussian model
 
@@ -60,7 +60,8 @@ $$
 \mathrm{Var} = \underbrace{p \sigma^2}_{\text{spread while on}} + \underbrace{p(1-p) \mu^2}_{\text{on/off switching}} .
 $$
 
-The 99th percentile of the sum over $N$ connections, divided by $N$, is then
+The summed load of $N$ connections has no hard maximum below $N P_{\max}$, so the model takes the
+99th percentile of the sum as the group maximum $P_{\max}(N)$. Dividing by $N P_{\max}(1) = N$ gives
 
 $$
 g(N) \approx p \mu + \frac{z_{0.99} \sqrt{p \sigma^2 + p(1-p) \mu^2}}{\sqrt{N}} .
@@ -70,7 +71,7 @@ This has Rusck's shape: a constant plus a term that decays like $1/\sqrt{N}$. Th
 identical when
 
 $$
-p \mu = s \qquad\text{and}\qquad z_{0.99} \sqrt{p \sigma^2 + p(1-p) \mu^2} = 1 - s .
+p \mu = g_\infty \qquad\text{and}\qquad z_{0.99} \sqrt{p \sigma^2 + p(1-p) \mu^2} = 1 - g_\infty .
 $$
 
 ### 3. Fitting at the peak
@@ -78,13 +79,13 @@ $$
 `--from-year-profile` sets
 
 $$
-\mu = \frac{s}{p}, \qquad \sigma = \frac{1 - \mu}{z_{0.99}}, \qquad P_{\max} = \frac{P_{\text{peak}}}{s} .
+\mu = \frac{g_\infty}{p}, \qquad \sigma = \frac{1 - \mu}{z_{0.99}}, \qquad P_{\max} = \frac{P_{\text{peak}}}{g_\infty} .
 $$
 
-The first condition, $p\mu = s$, always holds. Whether the second holds depends on $p$.
+The first condition, $p\mu = g_\infty$, always holds. Whether the second holds depends on $p$.
 
-**$p = 1$: exact match.** No switching term remains, so $\mu = s$ and $z_{0.99} \sigma = 1 - s$.
-Monte Carlo check for $s = 0.7$:
+**$p = 1$: exact match.** No switching term remains, so $\mu = g_\infty$ and $z_{0.99} \sigma = 1 - g_\infty$.
+Monte Carlo check for $g_\infty = 0.7$:
 
 | $N$ | Rusck | Gaussian model |
 | ---: | ---: | ---: |
@@ -98,13 +99,13 @@ Monte Carlo check for $s = 0.7$:
 The small gap for small $N$ comes from the truncation at $P_{\max}$.
 
 **$p < 1$: only the asymptote matches.** The switching variance makes the $1/\sqrt{N}$ term
-larger than $1 - s$. Even with $\sigma = 0$, the switching term alone exceeds $1 - s$ unless
+larger than $1 - g_\infty$. Even with $\sigma = 0$, the switching term alone exceeds $1 - g_\infty$ unless
 
 $$
-p \ge \frac{1}{1 + \left(\dfrac{1 - s}{z_{0.99} s}\right)^2} \qquad (\approx 0.967 \text{ for } s = 0.7) .
+p \ge \frac{1}{1 + \left(\dfrac{1 - g_\infty}{z_{0.99} g_\infty}\right)^2} \qquad (\approx 0.967 \text{ for } g_\infty = 0.7) .
 $$
 
-Monte Carlo check for $s = 0.7$ and $p = 0.9$:
+Monte Carlo check for $g_\infty = 0.7$ and $p = 0.9$:
 
 | $N$ | Rusck | Gaussian model |
 | ---: | ---: | ---: |
@@ -115,7 +116,7 @@ Monte Carlo check for $s = 0.7$ and $p = 0.9$:
 
 ### 4. Effect of $\mu$, $\sigma$ and $p$
 
-| Parameter | Effect on $g(\infty) = p \mu$ | Effect on the $1/\sqrt{N}$ term |
+| Parameter | Effect on $g_\infty = p \mu$ | Effect on the $1/\sqrt{N}$ term |
 | --- | --- | --- |
 | $\mu$ | sets the level | grows through the switching term $p(1-p)\mu^2$ |
 | $\sigma$ | none | grows; sets how far small groups lie above the asymptote |
@@ -135,17 +136,17 @@ $$
 
 Fewer connections are on, but each one that is on still draws the full $\mu$. Fluctuations
 relative to the mean therefore grow. To compare time steps, divide the simultaneity by that time
-step's own asymptote $g(\infty, t) = p(t) \mu$:
+step's own asymptote $g_\infty(t) = p(t) \mu$:
 
 $$
-\frac{g(N, t)}{g(\infty, t)} \approx 1 + \frac{z_{0.99}}{\sqrt{N}} \sqrt{\frac{1 + \sigma^2/\mu^2}{p(t)} - 1} .
+\frac{g(N, t)}{g_\infty(t)} \approx 1 + \frac{z_{0.99}}{\sqrt{N}} \sqrt{\frac{1 + \sigma^2/\mu^2}{p(t)} - 1} .
 $$
 
 This ratio decreases strictly as $p(t)$ grows. It is therefore smallest at the peak. For $p = 1$
-it equals Rusck's $g(N)/s = 1 + \frac{1 - s}{s\sqrt{N}}$ there, and it is larger at every other
+it equals Rusck's $g(N)/g_\infty = 1 + \frac{1 - g_\infty}{g_\infty\sqrt{N}}$ there, and it is larger at every other
 time step.
 
-Monte Carlo check of $g(N,t)/g(\infty,t)$ with $s = 0.7$ and $p = 1$:
+Monte Carlo check of $g(N,t)/g_\infty(t)$ with $g_\infty = 0.7$ and $p = 1$:
 
 | $P(t)/P_{\text{peak}}$ | $N = 10$ | $N = 50$ | $N = 200$ |
 | ---: | ---: | ---: | ---: |
@@ -212,10 +213,10 @@ grid-gmm \
   --save-config results/my_fitted_config.json
 ```
 
-With target simultaneity $s$ and peak activation probability $p$ (`--max-p-on`):
+With target asymptotic simultaneity $g_\infty$ and peak activation probability $p$ (`--max-p-on`):
 
-- $P_{\max} = P_{\text{peak}} / s$
-- $\mu_{\text{ratio}} = s / p$ (so $\mu \cdot p = P_{\text{peak}}$)
+- $P_{\max} = P_{\text{peak}} / g_\infty$
+- $\mu_{\text{ratio}} = g_\infty / p$ (so $\mu \cdot p = P_{\text{peak}}$)
 - $\sigma_{\text{ratio}} = (1 - \mu_{\text{ratio}}) / z_{0.99}$ (so $\mu + z_{0.99}\sigma = P_{\max}$)
 - $p(t) = p \cdot P(t) / P_{\text{peak}}$, split into 12 month factors and
   96 weekday/weekend interval factors
