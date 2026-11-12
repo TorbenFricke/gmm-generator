@@ -51,6 +51,8 @@ The hourly load is taken from the Quintel Energy Transition Model dataset,
 in `quintel/etdataset-public` (Dutch household demand profiles). It consists of 24 values in kW,
 the average load per household for each hour starting at 00:00.
 
+![Electric cooking input profile: 24 hourly values, peak 0.149 kW from 16:00 to 18:00](electric_cooking_daily_profile.png)
+
 | Property | Value |
 | --- | --- |
 | Peak | 0.1494 kW (hours 16:00 and 17:00) |

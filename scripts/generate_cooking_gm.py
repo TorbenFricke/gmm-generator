@@ -4,7 +4,8 @@
 The 24 hourly values below (kW, diversified average per household, hour starting at 00:00) are
 assumed to repeat on every day of the year. The script
 
-1. writes them as a one-year hourly profile to ``input_profiles/electric_cooking_hourly.csv``,
+1. writes them as a one-year hourly profile to ``input_profiles/electric_cooking_hourly.csv``
+   and plots the daily profile to ``docs/electric_cooking_daily_profile.png``,
 2. derives the asymptotic simultaneity from the chosen single-household maximum,
    ``g_inf = P_peak / P_max`` (default ``P_max = 3 kW``),
 3. keeps ``p(on)`` at the peak fixed (default 10 %) and calibrates ``mu`` and ``sigma``:
@@ -85,6 +86,31 @@ CALIBRATION_CONNECTIONS = np.array(DEFAULT_CONNECTIONS)
 DEFAULT_PROFILE = REPO_ROOT / "input_profiles" / "electric_cooking_hourly.csv"
 DEFAULT_RESULTS_STEM = REPO_ROOT / "results" / "electric_cooking_pmax_3kW"
 DEFAULT_CONFIG = REPO_ROOT / "results" / "electric_cooking_config.json"
+DEFAULT_PROFILE_PLOT = REPO_ROOT / "docs" / "electric_cooking_daily_profile.png"
+
+
+def plot_daily_profile(path: Path, hourly_kw: tuple[float, ...] = HOURLY_COOKING_KW, dpi: int = 150) -> Path:
+    """Plot the 24 hourly input values as a step curve (used in docs/electric_cooking_gm.md)."""
+    from matplotlib.figure import Figure
+
+    hours = np.arange(25)
+    values = np.append(hourly_kw, hourly_kw[-1])  # repeat last value so the 23:00 step reaches 24:00
+    fig = Figure(figsize=(8, 4), dpi=dpi)
+    ax = fig.add_subplot()
+    ax.step(hours, values, where="post", color="tab:orange", linewidth=2)
+    ax.fill_between(hours, values, step="post", color="tab:orange", alpha=0.2)
+    ax.set_xlim(0, 24)
+    ax.set_ylim(0, None)
+    ax.set_xticks(range(0, 25, 2))
+    ax.set_xticklabels([f"{h:02d}:00" for h in range(0, 25, 2)], rotation=45)
+    ax.set_xlabel("Hour of day")
+    ax.set_ylabel("Average load per household (kW)")
+    ax.set_title("Electric cooking: input daily profile (hourly, every day identical)")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=dpi)
+    return path
 
 
 def write_year_profile(path: Path, hourly_kw: tuple[float, ...] = HOURLY_COOKING_KW, year: int = PROFILE_YEAR) -> Path:
@@ -184,6 +210,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-p-on", type=float, default=0.1, help="p(on) at the peak (default: 0.1)")
     parser.add_argument("--runs", type=int, default=1000, help="Monte Carlo runs of the final simulation")
     parser.add_argument("--profile", type=Path, default=DEFAULT_PROFILE, help="Where to write the year profile")
+    parser.add_argument(
+        "--profile-plot", type=Path, default=DEFAULT_PROFILE_PLOT, help="Where to save the daily profile plot"
+    )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Where to save the fitted GM config")
     parser.add_argument("--results", type=Path, default=DEFAULT_RESULTS_STEM, help="Results path without extension")
     args = parser.parse_args(argv)
@@ -191,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
 
     profile = write_year_profile(args.profile)
     print(f"Wrote {len(HOURLY_COOKING_KW)}-hour daily profile for {PROFILE_YEAR} to {profile}")
+    print(f"Plotted daily profile to {plot_daily_profile(args.profile_plot)}")
 
     p_peak = max(HOURLY_COOKING_KW)
     g_inf = p_peak / args.p_max
