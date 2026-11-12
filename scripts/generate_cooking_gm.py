@@ -15,7 +15,7 @@ assumed to repeat on every day of the year. The script
    - ``sigma`` is chosen so that the simulated 99th-percentile simultaneity ``g(N)`` comes as
      close as possible to Rusck's ``g(N) = g_inf + (1 - g_inf) / sqrt(N)``,
 
-4. runs the regular CLI with these parameters and saves config, results and plot to ``results/``.
+4. runs the regular CLI with these parameters and saves config, xlsx export, results and plot to ``results/``.
 
 Note: for small ``g_inf`` Rusck's curve needs more variability than any model of independent
 households capped at ``P_max`` can provide (a single household's variance is at most
@@ -86,6 +86,7 @@ CALIBRATION_CONNECTIONS = np.array(DEFAULT_CONNECTIONS)
 DEFAULT_PROFILE = REPO_ROOT / "input_profiles" / "electric_cooking_hourly.csv"
 DEFAULT_RESULTS_STEM = REPO_ROOT / "results" / "electric_cooking_pmax_3kW"
 DEFAULT_CONFIG = REPO_ROOT / "results" / "electric_cooking_config.json"
+DEFAULT_XLSX = REPO_ROOT / "results" / "electric_cooking_gm.xlsx"
 DEFAULT_PROFILE_PLOT = REPO_ROOT / "docs" / "electric_cooking_daily_profile.png"
 
 
@@ -214,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         "--profile-plot", type=Path, default=DEFAULT_PROFILE_PLOT, help="Where to save the daily profile plot"
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Where to save the fitted GM config")
+    parser.add_argument("--xlsx", type=Path, default=DEFAULT_XLSX, help="Where to export the GM as one-row xlsx")
     parser.add_argument("--results", type=Path, default=DEFAULT_RESULTS_STEM, help="Results path without extension")
     args = parser.parse_args(argv)
     results_stem = str(args.results)  # not with_suffix(): the stem may contain a dot
@@ -245,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
             "--name", f"Electric Cooking (P_max={args.p_max:g} kW, p_on={args.max_p_on:.0%})",
             "--runs", str(args.runs),
             "--save-config", str(args.config),
+            "--save-xlsx", str(args.xlsx),
             "--csv", results_stem + ".csv",
             "--plot", results_stem + ".png",
         ]
