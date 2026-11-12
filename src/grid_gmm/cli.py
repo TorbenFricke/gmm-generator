@@ -21,6 +21,7 @@ from grid_gmm.simulation import (
     DEFAULT_SEED,
     MonteCarloEngine,
 )
+from grid_gmm.xlsx_export import model_name_from_path, save_model_to_xlsx
 
 DEFAULT_SIMULTANEITY = 0.3
 DEFAULT_MAX_P_ON = 1.0
@@ -105,6 +106,12 @@ def build_parser() -> argparse.ArgumentParser:
     out.add_argument("--csv", type=Path, default=Path(DEFAULT_CSV), help="Results CSV (default: %(default)s)")
     out.add_argument("--plot", type=Path, default=Path(DEFAULT_PLOT), help="Results plot (default: %(default)s)")
     out.add_argument("--save-config", type=Path, metavar="JSON", help="Also save the used component and factors")
+    out.add_argument(
+        "--save-xlsx",
+        type=Path,
+        metavar="XLSX",
+        help="Also export the model as a one-row xlsx (mu/sigma as ratios of P_max, named after the input file)",
+    )
     return parser
 
 
@@ -179,6 +186,11 @@ def _run(args: argparse.Namespace) -> int:
     if args.save_config is not None:
         save_config_to_json(component, factors, args.save_config)
         print(f"Configuration saved to:            {args.save_config.resolve()}")
+    if args.save_xlsx is not None:
+        source = args.from_year_profile or args.config
+        name = model_name_from_path(source) if source is not None else component.name
+        save_model_to_xlsx(component, factors, args.save_xlsx, name=name)
+        print(f"Model exported to xlsx:            {args.save_xlsx.resolve()} (Name: {name})")
 
     engine = MonteCarloEngine(component=component, factors=factors, seed=args.seed)
     results = engine.run_critical_time_simulation(
