@@ -2,8 +2,9 @@
 
 The layout has four parameter sets (``Average[1..4]``, ``Workday[1..4, 1..96]``, ...). This package
 models one component, so only set 1 is filled; all other columns, including the trend columns, are
-written as empty cells. ``Average[1]`` and ``Deviation[1]`` are mu and sigma as ratios of
-P_max (like the factors, all values are dimensionless). ``Cos`` is 1 (purely active load) and ``Correlation`` is 0.
+written as empty cells. ``Average[1]`` and ``Deviation[1]`` are mu and sigma in percent of P_max
+(e.g. 47.35 for a ratio of 0.4735); the factors stay plain ratios. ``Cos`` is 1 (purely active load)
+and ``Correlation`` is 0.
 
 The file is written with the standard library (``zipfile``), so no Excel library is required.
 """
@@ -24,6 +25,8 @@ from grid_gmm.model import GaussianComponent
 #: Number of parameter sets in the layout (only set 1 is filled).
 NUM_SETS = 4
 COS_PHI = 1.0
+#: Average and Deviation are exported in percent of P_max.
+PERCENT = 100.0
 CORRELATION = 0.0
 
 #: Words in a file name that describe the file rather than the load, dropped from the model name.
@@ -71,8 +74,8 @@ def xlsx_row(component: GaussianComponent, factors: FactorProfiles, name: str) -
         "Cos": COS_PHI,
         "Indicator": indicator_from_name(name),
         "Correlation": CORRELATION,
-        "Average[1]": component.mu_ratio,
-        "Deviation[1]": component.sigma_ratio,
+        "Average[1]": component.mu_ratio * PERCENT,
+        "Deviation[1]": component.sigma_ratio * PERCENT,
     }
     for prefix, values in (
         ("Workday", factors.weekday_factors),

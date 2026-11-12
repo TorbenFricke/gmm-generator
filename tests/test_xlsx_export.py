@@ -68,8 +68,8 @@ def test_row_values(tmp_path: Path):
     assert values["Indicator"] == "Electric"
     assert float(values["Cos"]) == 1.0
     assert float(values["Correlation"]) == 0.0
-    assert float(values["Average[1]"]) == pytest.approx(0.5)
-    assert float(values["Deviation[1]"]) == pytest.approx(0.25)
+    assert float(values["Average[1]"]) == pytest.approx(50.0)
+    assert float(values["Deviation[1]"]) == pytest.approx(25.0)
     assert [float(values[f"Workday[1,{i}]"]) for i in range(1, 97)] == pytest.approx(weekday)
     assert [float(values[f"Weekend[1,{i}]"]) for i in range(1, 97)] == pytest.approx(weekday[::-1])
     assert [float(values[f"Month[1,{i}]"]) for i in range(1, 13)] == pytest.approx(np.full(12, 0.9))

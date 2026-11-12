@@ -110,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--save-xlsx",
         type=Path,
         metavar="XLSX",
-        help="Also export the model as a one-row xlsx (mu/sigma as ratios of P_max, named after the input file)",
+        help="Also export the model as a one-row xlsx (mu/sigma in % of P_max, named after the input file)",
     )
     return parser
 
